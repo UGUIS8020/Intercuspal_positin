@@ -1,0 +1,7 @@
+__pycache__
+venv
+.env
+*.sqlite
+*.stl
+*.zip
+migrations
