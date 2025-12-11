@@ -19,20 +19,28 @@ try:
     import cupy as cp
     # CuPy インストール確認
     _ = cp.__version__
-    GPU_AVAILABLE = cp.cuda.is_available()
     
-    if GPU_AVAILABLE:
-        # cuBLAS動作テスト
-        try:
-            test = cp.array([1.0, 2.0, 3.0])
-            _ = cp.linalg.norm(test)
-            print("🚀 GPU (CUDA 13.1) が利用可能です")
-            print(f"   CuPy バージョン: {cp.__version__}")
-        except Exception as e:
-            print(f"⚠ GPU初期化エラー、CPUモードで実行します: {str(e)[:60]}...")
+    # CUDAドライバーエラーも含めて例外をキャッチ
+    try:
+        GPU_AVAILABLE = cp.cuda.is_available()
+        
+        if GPU_AVAILABLE:
+            # cuBLAS動作テスト
+            try:
+                test = cp.array([1.0, 2.0, 3.0])
+                _ = cp.linalg.norm(test)
+                print("🚀 GPU (CUDA 13.1) が利用可能です")
+                print(f"   CuPy バージョン: {cp.__version__}")
+            except Exception as e:
+                print(f"⚠ GPU初期化エラー、CPUモードで実行します: {str(e)[:60]}...")
+                GPU_AVAILABLE = False
+        else:
+            print("💻 CUDA デバイスが見つかりません")
             GPU_AVAILABLE = False
-    else:
-        print("💻 CUDA デバイスが見つかりません")
+    except Exception as cuda_error:
+        # CUDAドライバー不足エラーなどをキャッチ
+        print("💻 CPU モードで実行します (CUDA ドライバー不足)")
+        print(f"   詳細: {str(cuda_error)[:80]}...")
         GPU_AVAILABLE = False
         
 except ImportError as e:
