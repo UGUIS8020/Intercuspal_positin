@@ -411,9 +411,13 @@ class ContactAnalyzer:
         # 右側咬合不足ペナルティ
         lr_imbalance = abs(analysis['left_area'] - analysis['right_area'])
         
-        # 輪ゴム最適化モードの場合は特別なスコア計算を使用
+        # 輪ゴム最適化モード：全方向均等圧力を簡易模擬
         if hasattr(self.config, 'ELASTIC_FORCE_MODE') and self.config.ELASTIC_FORCE_MODE:
-            analysis['score'] = calculate_elastic_rubber_score(analysis, self.config)
+            # 輪ゴム効果：前後・左右バランスを極端に重視（縦横に締めつける効果）
+            elastic_balance = (analysis['ap_balance'] + analysis['lr_balance']) / 2.0
+            # 理想的な50:50バランスに近いほど高スコア
+            rubber_factor = 1.0 + (elastic_balance * 5.0)  # 均等性を5倍重視
+            analysis['score'] = analysis['total_area'] * rubber_factor - lr_imbalance * 2.0
         else:
             analysis['score'] = (
                 analysis['total_area']
@@ -499,7 +503,7 @@ def calculate_elastic_rubber_score(analysis, config):
         positive_mask = projections > 0
         if np.any(positive_mask):
             # ここでは簡易的に接触点数を面積として扱う
-            sector_area = np.sum(positive_mask) / len(contact_points)
+            sector_area = np.sum(positive_mask) / contact_array.shape[0]
         else:
             sector_area = 0.0
         
@@ -511,9 +515,9 @@ def calculate_elastic_rubber_score(analysis, config):
     uniformity_score = 1.0 - np.mean(sector_deviations)
     
     # 弾性収束効果：接触点の分散が小さいほど（まとまっているほど）良い
-    if len(contact_points) > 1:
+    if contact_array.shape[0] > 1:
         distances_from_center = np.linalg.norm(
-            contact_points[:, :2] - np.array([center_x, center_y]), axis=1
+            contact_array[:, :2] - np.array([center_x, center_y]), axis=1
         )
         distance_std = np.std(distances_from_center)
         distance_mean = np.mean(distances_from_center)

@@ -63,7 +63,7 @@ def per_vertex_area(mesh: trimesh.Trimesh):
 
 
 # =============================
-# スコアリング（輪ゴム / バネモデル）
+# スコアリング（輪ゴム / バネモデル＋左右バランス強化）
 # =============================
 
 class SpringOcclusionScorer:
@@ -80,8 +80,10 @@ class SpringOcclusionScorer:
         contact_threshold: float = 0.03,
         rot_penalty: float = 1.5,
         trans_penalty: float = 2.0,
-        balance_ap_weight: float = 0.4,
-        balance_lr_weight: float = 0.4,
+        balance_ap_weight: float = 0.3,
+        balance_lr_weight: float = 0.6,
+        imbalance_ap_weight: float = 0.8,
+        imbalance_lr_weight: float = 1.8,
     ):
         self.upper = upper_mesh
         self.v0 = lower_sample_vertices  # 形態（座標）の基準
@@ -91,6 +93,9 @@ class SpringOcclusionScorer:
         self.trans_penalty = trans_penalty
         self.balance_ap_weight = balance_ap_weight
         self.balance_lr_weight = balance_lr_weight
+        # アンバランスに対するペナルティ
+        self.imbalance_ap_weight = imbalance_ap_weight
+        self.imbalance_lr_weight = imbalance_lr_weight
 
         # 左右 / 前後の境界（下顎の元の座標系で決めておく）
         self.x_mid = float(np.median(self.v0[:, 0]))
@@ -98,20 +103,21 @@ class SpringOcclusionScorer:
         print(f"  左右の境界 (x_mid) = {self.x_mid:.4f} mm")
         print(f"  前後の境界 (y_mid) = {self.y_mid:.4f} mm")
 
-    def evaluate(self, rx_rad, ry_rad, tz, max_dist_clip=0.1):
+    def evaluate(self, tx, rx_rad, ry_rad, tz, max_dist_clip=0.1):
         """
-        姿勢 (rx, ry, tz) に対するスコアを返す
+        姿勢 (tx, rx, ry, tz) に対するスコアを返す
+        - tx: 左右方向スライド（mm）
         - rx, ry: ラジアン（X, Y軸まわりの回転）
-        - tz: mm（垂直方向の出し入れ）
-        tx, ty は 0 固定（バイト位置を原点とみなす）
+        - tz: 垂直方向（mm）
+        ty は 0 固定（前後スライドはここでは見ない）
         """
-        tx, ty = 0.0, 0.0
+        ty = 0.0
 
         # 剛体変換（下顎サンプル頂点）
         rot = R.from_euler("xyz", [rx_rad, ry_rad, 0.0]).as_matrix()
         transformed = (rot @ self.v0.T).T + np.array([tx, ty, tz])
 
-        # 上顎メッシュとの最近接距離（trimesh が内部でkd-treeをキャッシュ）
+        # 上顎メッシュとの最近接距離
         closest_points, distances, tri_id = self.upper.nearest.on_surface(transformed)
 
         # 「輪ゴムが届いている」範囲：contact_threshold 以内
@@ -119,9 +125,11 @@ class SpringOcclusionScorer:
         contact_mask = d <= self.contact_threshold
 
         if not np.any(contact_mask):
-            # まったく噛んでいないなら、ほぼ0スコア（少しだけ回転・移動ペナルティ）
-            penalty = self.rot_penalty * (abs(rx_rad) + abs(ry_rad)) + \
-                      self.trans_penalty * abs(tz)
+            # まったく噛んでいないなら、回転・移動だけペナルティ
+            penalty = (
+                self.rot_penalty * (abs(rx_rad) + abs(ry_rad))
+                + self.trans_penalty * np.sqrt(tx * tx + tz * tz)
+            )
             return -penalty, {
                 "total_area": 0.0,
                 "anterior_area": 0.0,
@@ -129,6 +137,7 @@ class SpringOcclusionScorer:
                 "left_area": 0.0,
                 "right_area": 0.0,
                 "num_contacts": 0,
+                "tx": tx,
                 "rx": rx_rad,
                 "ry": ry_rad,
                 "tz": tz,
@@ -140,7 +149,6 @@ class SpringOcclusionScorer:
 
         # バネっぽいスコア:
         # d = 0 で最大、threshold で 0 になるようなカーブ
-        # S_local = area * (1 - (d/th)^2)
         th = self.contact_threshold
         weight = 1.0 - (contact_d / th) ** 2
         weight = np.clip(weight, 0.0, 1.0)
@@ -160,20 +168,27 @@ class SpringOcclusionScorer:
         left_area = float(contact_a[x <= self.x_mid].sum())
         right_area = float(contact_a[x > self.x_mid].sum())
 
-        # バランススコア（輪ゴムが偏っていないほど良い）
+        # バランススコア（左右・前後どちらも「両方噛んでいる」ほど加点）
         ap_balance = min(anterior_area, posterior_area)
         lr_balance = min(left_area, right_area)
-
         balance_score = (
-            self.balance_ap_weight * ap_balance +
-            self.balance_lr_weight * lr_balance
+            self.balance_ap_weight * ap_balance
+            + self.balance_lr_weight * lr_balance
+        )
+
+        # アンバランスペナルティ（片側だけで支えていると大きく減点）
+        ap_imbalance = abs(anterior_area - posterior_area)
+        lr_imbalance = abs(left_area - right_area)
+        imbalance_pen = (
+            self.imbalance_ap_weight * ap_imbalance
+            + self.imbalance_lr_weight * lr_imbalance
         )
 
         # 回転・移動は大きすぎるとペナルティ
         rot_pen = self.rot_penalty * (abs(rx_rad) + abs(ry_rad))
-        trans_pen = self.trans_penalty * abs(tz)
+        trans_pen = self.trans_penalty * np.sqrt(tx * tx + tz * tz)
 
-        total_score = contact_score + balance_score - rot_pen - trans_pen
+        total_score = contact_score + balance_score - rot_pen - trans_pen - imbalance_pen
 
         info = {
             "total_area": total_area,
@@ -182,6 +197,7 @@ class SpringOcclusionScorer:
             "left_area": left_area,
             "right_area": right_area,
             "num_contacts": int(contact_a.shape[0]),
+            "tx": tx,
             "rx": rx_rad,
             "ry": ry_rad,
             "tz": tz,
@@ -194,7 +210,7 @@ class SpringOcclusionScorer:
 # =============================
 
 def line_search_tz(scorer: SpringOcclusionScorer,
-                   rx0=0.0, ry0=0.0,
+                   tx0=0.0, rx0=0.0, ry0=0.0,
                    tz_start=0.5, tz_end=-1.5, step=-0.05):
     """
     tz 方向にまっすぐ閉口しながら、スコア最大となる tz を探す
@@ -205,12 +221,15 @@ def line_search_tz(scorer: SpringOcclusionScorer,
     best_info = None
 
     tz = tz_start
-    print("\n[Step1] tz 方向の単純スキャンで良さそうな初期位置を探索")
+    print("\n[Step1] tz 方向スキャンで初期位置を探索")
     i = 0
     while tz >= tz_end - 1e-9:
-        score, info = scorer.evaluate(rx0, ry0, tz)
+        score, info = scorer.evaluate(tx0, rx0, ry0, tz)
         if i % 5 == 0:
-            print(f"  tz={tz:6.3f} mm -> score={score:7.3f}, area={info['total_area']:.4f}")
+            print(
+                f"  tz={tz:6.3f} mm -> score={score:7.3f}, "
+                f"area={info['total_area']:.4f}, LR={info['left_area']:.3f}/{info['right_area']:.3f}"
+            )
         if score > best_score:
             best_score = score
             best_tz = tz
@@ -218,28 +237,37 @@ def line_search_tz(scorer: SpringOcclusionScorer,
         tz += step
         i += 1
 
-    print(f"\n  → 初期候補: tz={best_tz:.3f} mm, score={best_score:.3f}, "
-          f"area={best_info['total_area']:.4f}")
+    print(
+        f"\n  → 初期候補: tz={best_tz:.3f} mm, score={best_score:.3f}, "
+        f"area={best_info['total_area']:.4f}, LR={best_info['left_area']:.3f}/{best_info['right_area']:.3f}"
+    )
     return best_tz, best_score, best_info
 
 
-def hill_climb_3d(scorer: SpringOcclusionScorer,
-                  rx_init, ry_init, tz_init,
-                  deg_step=0.5, tz_step=0.05,
-                  max_iter=25,
+def hill_climb_4d(scorer: SpringOcclusionScorer,
+                  tx_init, rx_init, ry_init, tz_init,
+                  tx_step=0.05, deg_step=0.5, tz_step=0.05,
+                  max_iter=20,
+                  tx_min=-0.8, tx_max=0.8,
                   max_rot_deg=5.0,
                   tz_min=-2.0, tz_max=1.0):
     """
-    (rx, ry, tz) の3自由度ヒルクライム
+    (tx, rx, ry, tz) の4自由度ヒルクライム
+    左右スライド + 前後・左右回転 + 上下
     """
+    tx = tx_init
     rx = rx_init
     ry = ry_init
     tz = tz_init
 
-    score, info = scorer.evaluate(rx, ry, tz)
+    score, info = scorer.evaluate(tx, rx, ry, tz)
     print("\n[Step2] 近傍ヒルクライム開始")
-    print(f"  start: rx={np.rad2deg(rx):.3f}°, ry={np.rad2deg(ry):.3f}°, "
-          f"tz={tz:.3f} mm, score={score:.3f}, area={info['total_area']:.4f}")
+    print(
+        f"  start: tx={tx:.3f}mm, rx={np.rad2deg(rx):.3f}°, "
+        f"ry={np.rad2deg(ry):.3f}°, tz={tz:.3f} mm, "
+        f"score={score:.3f}, area={info['total_area']:.4f}, "
+        f"LR={info['left_area']:.3f}/{info['right_area']:.3f}"
+    )
 
     rad_step = np.deg2rad(deg_step)
     max_rot_rad = np.deg2rad(max_rot_deg)
@@ -247,44 +275,51 @@ def hill_climb_3d(scorer: SpringOcclusionScorer,
     for it in range(max_iter):
         improved = False
         best_local_score = score
-        best_local_params = (rx, ry, tz)
+        best_local_params = (tx, rx, ry, tz)
         best_local_info = info
 
-        for d_rx in [-rad_step, 0.0, rad_step]:
-            for d_ry in [-rad_step, 0.0, rad_step]:
-                for d_tz in [-tz_step, 0.0, tz_step]:
-                    if d_rx == 0.0 and d_ry == 0.0 and d_tz == 0.0:
-                        continue
+        for d_tx in [-tx_step, 0.0, tx_step]:
+            for d_rx in [-rad_step, 0.0, rad_step]:
+                for d_ry in [-rad_step, 0.0, rad_step]:
+                    for d_tz in [-tz_step, 0.0, tz_step]:
+                        if d_tx == 0.0 and d_rx == 0.0 and d_ry == 0.0 and d_tz == 0.0:
+                            continue
 
-                    rx_c = rx + d_rx
-                    ry_c = ry + d_ry
-                    tz_c = tz + d_tz
+                        tx_c = tx + d_tx
+                        rx_c = rx + d_rx
+                        ry_c = ry + d_ry
+                        tz_c = tz + d_tz
 
-                    # 範囲制限
-                    if abs(rx_c) > max_rot_rad or abs(ry_c) > max_rot_rad:
-                        continue
-                    if tz_c < tz_min or tz_c > tz_max:
-                        continue
+                        # 範囲制限
+                        if tx_c < tx_min or tx_c > tx_max:
+                            continue
+                        if abs(rx_c) > max_rot_rad or abs(ry_c) > max_rot_rad:
+                            continue
+                        if tz_c < tz_min or tz_c > tz_max:
+                            continue
 
-                    s_c, info_c = scorer.evaluate(rx_c, ry_c, tz_c)
-                    if s_c > best_local_score:
-                        best_local_score = s_c
-                        best_local_params = (rx_c, ry_c, tz_c)
-                        best_local_info = info_c
-                        improved = True
+                        s_c, info_c = scorer.evaluate(tx_c, rx_c, ry_c, tz_c)
+                        if s_c > best_local_score:
+                            best_local_score = s_c
+                            best_local_params = (tx_c, rx_c, ry_c, tz_c)
+                            best_local_info = info_c
+                            improved = True
 
         if not improved:
             print(f"  it={it}: 改善なし → 終了")
             break
 
-        rx, ry, tz = best_local_params
+        tx, rx, ry, tz = best_local_params
         score = best_local_score
         info = best_local_info
-        print(f"  it={it+1}: rx={np.rad2deg(rx):5.2f}°, ry={np.rad2deg(ry):5.2f}°, "
-              f"tz={tz:6.3f} mm, score={score:7.3f}, area={info['total_area']:.4f}, "
-              f"contacts={info['num_contacts']}")
+        print(
+            f"  it={it+1}: tx={tx:6.3f}mm, rx={np.rad2deg(rx):5.2f}°, "
+            f"ry={np.rad2deg(ry):5.2f}°, tz={tz:6.3f} mm, "
+            f"score={score:7.3f}, area={info['total_area']:.4f}, "
+            f"LR={info['left_area']:.3f}/{info['right_area']:.3f}"
+        )
 
-    return rx, ry, tz, score, info
+    return tx, rx, ry, tz, score, info
 
 
 # =============================
@@ -293,7 +328,7 @@ def hill_climb_3d(scorer: SpringOcclusionScorer,
 
 def main():
     print("=" * 80)
-    print("咬頭嵌合位自動最適化（輪ゴムスプリングモデル・簡易高速版）")
+    print("咬頭嵌合位自動最適化（輪ゴムスプリングモデル・左右バランス強化版）")
     print("=" * 80)
 
     upper_path, lower_path = select_two_stl_files()
@@ -306,7 +341,7 @@ def main():
 
     all_vertices = lower.vertices
     n_vertices = len(all_vertices)
-    SAMPLE_SIZE = 1200  # 計算時間と精度のバランス（800〜2000くらいで調整可）
+    SAMPLE_SIZE = 1200  # 計算時間と精度のバランス
 
     if n_vertices > SAMPLE_SIZE:
         rng = np.random.default_rng(0)
@@ -325,15 +360,18 @@ def main():
         lower_sample_vertices=sample_vertices,
         lower_sample_areas=sample_areas,
         contact_threshold=0.03,     # 0〜0.03mm を「輪ゴムが届いている範囲」とみなす
-        rot_penalty=1.5,            # 回転ペナルティ
-        trans_penalty=2.0,          # tzペナルティ
-        balance_ap_weight=0.4,      # 前後バランスの重み
-        balance_lr_weight=0.4,      # 左右バランスの重み
+        rot_penalty=1.5,
+        trans_penalty=2.0,
+        balance_ap_weight=0.3,
+        balance_lr_weight=0.6,      # 左右バランスを少し重く
+        imbalance_ap_weight=0.8,
+        imbalance_lr_weight=1.8,    # 左右アンバランスにかなり強くペナルティ
     )
 
     # Step1: tz 方向スキャンで初期位置
     best_tz, best_score_tz, info_tz = line_search_tz(
         scorer,
+        tx0=0.0,
         rx0=0.0,
         ry0=0.0,
         tz_start=0.5,
@@ -341,22 +379,27 @@ def main():
         step=-0.05
     )
 
-    # Step2: 近傍ヒルクライム
-    rx_best, ry_best, tz_best, score_best, info_best = hill_climb_3d(
+    # Step2: 近傍ヒルクライム（tx も含めて最適化）
+    tx_best, rx_best, ry_best, tz_best, score_best, info_best = hill_climb_4d(
         scorer,
+        tx_init=0.0,
         rx_init=0.0,
         ry_init=0.0,
         tz_init=best_tz,
+        tx_step=0.05,
         deg_step=0.5,
         tz_step=0.05,
-        max_iter=25,
+        max_iter=20,
+        tx_min=-0.8,
+        tx_max=0.8,
         max_rot_deg=5.0,
         tz_min=-2.0,
         tz_max=1.0,
     )
 
-    print("\n最終結果（輪ゴムスプリングモデル）")
+    print("\n最終結果（輪ゴムスプリング＋左右バランス強化）")
     print("-" * 80)
+    print(f"  tx = {tx_best:6.3f} mm")
     print(f"  rx = {np.rad2deg(rx_best):6.3f} °")
     print(f"  ry = {np.rad2deg(ry_best):6.3f} °")
     print(f"  tz = {tz_best:6.3f} mm")
@@ -371,14 +414,14 @@ def main():
 
     # 下顎全体に最終変換を適用して保存
     rot_best = R.from_euler("xyz", [rx_best, ry_best, 0.0]).as_matrix()
-    transformed_all = (rot_best @ lower.vertices.T).T + np.array([0.0, 0.0, tz_best])
+    transformed_all = (rot_best @ lower.vertices.T).T + np.array([tx_best, 0.0, tz_best])
 
     lower_out = lower.copy()
     lower_out.vertices = transformed_all
 
     out_dir = os.path.dirname(lower_path)
     lower_name = os.path.splitext(os.path.basename(lower_path))[0]
-    out_path = os.path.join(out_dir, f"{lower_name}_spring_mip.stl")
+    out_path = os.path.join(out_dir, f"{lower_name}_spring_balanced.stl")
     lower_out.export(out_path)
     print(f"\n✓ 最終下顎 STL を保存しました: {out_path}")
     print("=" * 80)
