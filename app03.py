@@ -171,6 +171,27 @@ class OptimizationConfig:
             "ROTATION_PENALTY": 1.2,         # 適度な回転制限
             "TRANSLATION_PENALTY": 1.8,      # 移動制限強化（沈み込み防止）
         },
+        # ★★★★★★ 新追加：超均等分布特化モード（itouTOMOYO用）
+        "超均等分布特化": {
+            "CONTACT_THRESHOLD": 0.045,      # 広範囲接触検出で全体分布を捉える
+            "TIGHT_THRESHOLD": 0.02,         # 緩い緊密判定で偏り防止
+            "BALANCE_AP_WEIGHT": 2.0,        # 前後バランス超最重視
+            "BALANCE_LR_WEIGHT": 2.2,        # 左右バランス極度重視（右側偏り解消）
+            "PENETRATION_PENALTY": 0.3,      # めり込み軽微許容で分布優先
+            "ROTATION_PENALTY": 0.6,         # 回転を大幅に柔軟化
+            "TRANSLATION_PENALTY": 0.9,      # 移動を柔軟化で分布改善
+        },
+        # ★★★★★★★ 輪ゴム最適化モード（全方向均等弾性力）
+        "輪ゴム最適化": {
+            "CONTACT_THRESHOLD": 0.05,       # 最大範囲接触検出
+            "TIGHT_THRESHOLD": 0.025,        # 全方向からの弾性力を模擬
+            "BALANCE_AP_WEIGHT": 3.0,        # 縦方向の輪ゴム効果
+            "BALANCE_LR_WEIGHT": 3.0,        # 横方向の輪ゴム効果  
+            "PENETRATION_PENALTY": 0.1,      # 弾性変形を許容
+            "ROTATION_PENALTY": 0.3,         # 自然な回転を許可
+            "TRANSLATION_PENALTY": 0.5,      # 弾性収束を促進
+            "description": "上下顎を輪ゴムで縦横にぐるぐる巻きにした時の全方向均等弾性力を模擬"
+        },
     }
     
     def __init__(self, preset="バランス型"):
@@ -224,6 +245,19 @@ class OptimizationConfig:
             self.MAX_CLOSE_STEPS = 35        # 段階的接近（沈み込み防止）
             self.NUM_MULTISTART = 9          # より多くの候補（最適解探索）
             self.MAX_LBFGS_ITER = 90         # 精密最適化
+        elif preset == "超均等分布特化":
+            # 超均等分布特化モード：itouTOMOYO用最高レベル均等分布
+            self.SAMPLE_SIZE = 3500          # 超高精度サンプリング
+            self.MAX_CLOSE_STEPS = 45        # 詳細接触確立で全域分布
+            self.NUM_MULTISTART = 12         # 大量候補生成で最適解発見
+            self.MAX_LBFGS_ITER = 150        # 最高精度最適化
+        elif preset == "輪ゴム最適化":
+            # 輪ゴム最適化モード：全方向均等弾性力による収束
+            self.SAMPLE_SIZE = 4000          # 最大精度サンプリング
+            self.MAX_CLOSE_STEPS = 60        # 弾性的段階接近
+            self.NUM_MULTISTART = 15         # 多方向からの収束試行
+            self.MAX_LBFGS_ITER = 200        # 弾性最適化の精度向上
+            self.ELASTIC_FORCE_MODE = True   # 輪ゴム弾性力有効化
         else:
             # 高精度モード：接触分析の精度を向上
             self.SAMPLE_SIZE = 1500          # 精度向上（2000→1500で安全性確保）
@@ -377,16 +411,20 @@ class ContactAnalyzer:
         # 右側咬合不足ペナルティ
         lr_imbalance = abs(analysis['left_area'] - analysis['right_area'])
         
-        analysis['score'] = (
-            analysis['total_area']
-            + self.config.BALANCE_AP_WEIGHT * analysis['ap_balance']
-            + self.config.BALANCE_LR_WEIGHT * analysis['lr_balance']
-            - self.config.PENETRATION_PENALTY * analysis['tight_area']
-            - self.config.ROTATION_PENALTY * rot_penalty
-            - self.config.TRANSLATION_PENALTY * trans_penalty
-            - depth_penalty  # 沈み込み深度ペナルティ追加
-            - 0.3 * lr_imbalance  # 左右不均衡ペナルティ追加
-        )
+        # 輪ゴム最適化モードの場合は特別なスコア計算を使用
+        if hasattr(self.config, 'ELASTIC_FORCE_MODE') and self.config.ELASTIC_FORCE_MODE:
+            analysis['score'] = calculate_elastic_rubber_score(analysis, self.config)
+        else:
+            analysis['score'] = (
+                analysis['total_area']
+                + self.config.BALANCE_AP_WEIGHT * analysis['ap_balance']
+                + self.config.BALANCE_LR_WEIGHT * analysis['lr_balance']
+                - self.config.PENETRATION_PENALTY * analysis['tight_area']
+                - self.config.ROTATION_PENALTY * rot_penalty
+                - self.config.TRANSLATION_PENALTY * trans_penalty
+                - depth_penalty  # 沈み込み深度ペナルティ追加
+                - 0.3 * lr_imbalance  # 左右不均衡ペナルティ追加
+            )
         
         return analysis
     
@@ -414,6 +452,76 @@ class ContactAnalyzer:
         rot_gpu = cp.asarray(rot)
         translation_gpu = cp.asarray([tx, ty, tz])
         return cp.dot(self.sample_vertices_gpu, rot_gpu.T) + translation_gpu
+
+def calculate_elastic_rubber_score(analysis, config):
+    """輪ゴム弾性力を模擬したスコア計算（全方向均等圧力）"""
+    if analysis['total_area'] == 0:
+        return -1000.0  # 接触がない場合は最低スコア
+    
+    # 基本的な接触評価
+    base_score = analysis['total_area']
+    
+    # 8方向セクター分析（輪ゴムが縦横に巻かれた状態を模擬）
+    contact_points = analysis['contact_points']
+    if len(contact_points) == 0:
+        return -1000.0
+    
+    # 中心座標計算
+    center_x = np.mean(contact_points[:, 0])
+    center_y = np.mean(contact_points[:, 1])
+    
+    # 8方向（上下左右+斜め4方向）の分布を計算
+    angles = np.linspace(0, 2*np.pi, 8, endpoint=False)
+    sector_areas = []
+    
+    for angle in angles:
+        # 各セクターの方向ベクトル
+        direction = np.array([np.cos(angle), np.sin(angle)])
+        
+        # 各接触点がこの方向に投影される値
+        relative_points = contact_points[:, :2] - np.array([center_x, center_y])
+        projections = np.dot(relative_points, direction)
+        
+        # この方向の正の側にある接触点の面積
+        positive_mask = projections > 0
+        if np.any(positive_mask):
+            # ここでは簡易的に接触点数を面積として扱う
+            sector_area = np.sum(positive_mask) / len(contact_points)
+        else:
+            sector_area = 0.0
+        
+        sector_areas.append(sector_area)
+    
+    # 輪ゴム効果：全方向が理想的に0.5（50%）に近いほど高スコア
+    ideal_ratio = 0.5
+    sector_deviations = [abs(area - ideal_ratio) for area in sector_areas]
+    uniformity_score = 1.0 - np.mean(sector_deviations)
+    
+    # 弾性収束効果：接触点の分散が小さいほど（まとまっているほど）良い
+    if len(contact_points) > 1:
+        distances_from_center = np.linalg.norm(
+            contact_points[:, :2] - np.array([center_x, center_y]), axis=1
+        )
+        distance_std = np.std(distances_from_center)
+        distance_mean = np.mean(distances_from_center)
+        compactness_score = 1.0 / (1.0 + distance_std / (distance_mean + 1e-6))
+    else:
+        compactness_score = 1.0
+    
+    # 輪ゴムの縦横効果（従来の前後左右バランス強化）
+    ap_balance = min(analysis['anterior_area'], analysis['posterior_area']) / (max(analysis['anterior_area'], analysis['posterior_area']) + 1e-6)
+    lr_balance = min(analysis['left_area'], analysis['right_area']) / (max(analysis['left_area'], analysis['right_area']) + 1e-6)
+    
+    # 総合輪ゴムスコア
+    rubber_score = (
+        base_score +
+        config.BALANCE_AP_WEIGHT * ap_balance * 2.0 +  # 縦方向の輪ゴム
+        config.BALANCE_LR_WEIGHT * lr_balance * 2.0 +  # 横方向の輪ゴム
+        1.5 * uniformity_score +                       # 8方向均等性
+        0.8 * compactness_score                        # 弾性収束
+    )
+    
+    return rubber_score
     
     def _gpu_distance_calculation(self, transformed_gpu):
         """GPU上で距離計算を実行"""
@@ -720,7 +828,7 @@ def multistart_optimization(analyzer, base_params, config):
         })
     
     # スコアでソート（均等咬合最適化の場合はバランス重視）
-    if hasattr(config, 'preset_name') and config.preset_name in ["均等咬合最適化", "精密均等咬合"]:
+    if hasattr(config, 'preset_name') and config.preset_name in ["均等咬合最適化", "精密均等咬合", "超均等分布特化"]:
         # バランススコア重視でソート
         def balance_score(cand):
             analysis = cand['analysis']
@@ -728,7 +836,28 @@ def multistart_optimization(analyzer, base_params, config):
             # 前後・左右バランスが均等であるほど高スコア
             ap_balance_ratio = min(analysis['anterior_area'], analysis['posterior_area']) / (max(analysis['anterior_area'], analysis['posterior_area']) + 1e-6)
             lr_balance_ratio = min(analysis['left_area'], analysis['right_area']) / (max(analysis['left_area'], analysis['right_area']) + 1e-6)
-            balance_bonus = (ap_balance_ratio + lr_balance_ratio) * 0.5
+            
+            # 超均等分布特化モードの場合はより厳格な均等性要求
+            if config.preset_name == "超均等分布特化":
+                # 4象限の均等性を評価（前左、前右、後左、後右）
+                total_area = analysis['total_area']
+                if total_area > 0:
+                    # 理想的には各象限が25%ずつ
+                    anterior_left = analysis.get('anterior_left_area', 0)
+                    anterior_right = analysis.get('anterior_right_area', 0)
+                    posterior_left = analysis.get('posterior_left_area', 0)
+                    posterior_right = analysis.get('posterior_right_area', 0)
+                    
+                    # 各象限の比率を計算
+                    quadrant_ratios = np.array([anterior_left, anterior_right, posterior_left, posterior_right]) / total_area
+                    # 理想比率（各25%）からの偏差を計算
+                    ideal_ratio = 0.25
+                    uniformity_penalty = np.sum(np.abs(quadrant_ratios - ideal_ratio))
+                    balance_bonus = (2.0 - uniformity_penalty) * 1.5  # 超強化
+                else:
+                    balance_bonus = (ap_balance_ratio + lr_balance_ratio) * 1.2
+            else:
+                balance_bonus = (ap_balance_ratio + lr_balance_ratio) * 0.5
             
             # 沈み込み深度ペナルティ（tz値を考慮）
             tx, ty, rx, ry, tz = cand['params']

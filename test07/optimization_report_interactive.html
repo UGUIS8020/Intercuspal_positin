@@ -1,0 +1,1251 @@
+
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>咬頭嵌合位最適化レポート</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #333;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+            padding: 30px;
+        }
+        h1 {
+            color: #667eea;
+            text-align: center;
+            margin-bottom: 10px;
+        }
+        .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 30px;
+        }
+        .config-info {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 30px;
+            border-left: 4px solid #667eea;
+        }
+        .candidate {
+            border: 2px solid #e0e0e0;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 30px;
+            transition: all 0.3s;
+        }
+        .candidate:hover {
+            border-color: #667eea;
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.3);
+        }
+        .candidate.best {
+            border-color: #28a745;
+            background: #f0fff4;
+        }
+        .candidate-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        .candidate-title {
+            font-size: 1.3em;
+            font-weight: bold;
+            color: #667eea;
+        }
+        .candidate.best .candidate-title {
+            color: #28a745;
+        }
+        .badge {
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 0.9em;
+            font-weight: bold;
+        }
+        .badge-best {
+            background: #28a745;
+            color: white;
+        }
+        .badge-rank {
+            background: #6c757d;
+            color: white;
+        }
+        .params-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }
+        .param-box {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+        }
+        .param-label {
+            font-size: 0.9em;
+            color: #666;
+            margin-bottom: 5px;
+        }
+        .param-value {
+            font-size: 1.3em;
+            font-weight: bold;
+            color: #333;
+        }
+        .analysis-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }
+        .analysis-box {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+        }
+        .analysis-label {
+            font-size: 0.85em;
+            opacity: 0.9;
+            margin-bottom: 5px;
+        }
+        .analysis-value {
+            font-size: 1.4em;
+            font-weight: bold;
+        }
+        .progress-bar {
+            width: 100%;
+            height: 10px;
+            background: #e0e0e0;
+            border-radius: 5px;
+            overflow: hidden;
+            margin-top: 5px;
+        }
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #28a745, #20c997);
+            transition: width 0.3s;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #e0e0e0;
+        }
+        th {
+            background: #f8f9fa;
+            font-weight: bold;
+            color: #667eea;
+        }
+        .footer {
+            text-align: center;
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #e0e0e0;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🦷 咬頭嵌合位最適化レポート</h1>
+        <div class="subtitle">生成日時: 2025年12月12日 15:07:41</div>
+        
+        <div class="config-info">
+            <strong>📋 使用プリセット:</strong> 超均等分布特化<br>
+            <strong>🔍 サンプル数:</strong> 3500 頂点<br>
+            <strong>🎯 接触閾値:</strong> 0.045 mm<br>
+            <strong>🔄 マルチスタート:</strong> 12 回
+        </div>
+
+        <div class="candidate best">
+            <div class="candidate-header">
+                <div class="candidate-title">候補 1 - ベース位置</div>
+                <span class="badge badge-best">🏆 最優秀候補</span>
+            </div>
+            
+            <div class="params-grid">
+                <div class="param-box">
+                    <div class="param-label">水平移動 X</div>
+                    <div class="param-value">0.000 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">水平移動 Y</div>
+                    <div class="param-value">0.000 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">垂直移動 Z</div>
+                    <div class="param-value">-0.050 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">回転 X軸</div>
+                    <div class="param-value">0.00°</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">回転 Y軸</div>
+                    <div class="param-value">0.00°</div>
+                </div>
+            </div>
+            
+            <div class="analysis-grid">
+                <div class="analysis-box">
+                    <div class="analysis-label">総合スコア</div>
+                    <div class="analysis-value">1.13</div>
+                </div>
+                <div class="analysis-box">
+                    <div class="analysis-label">総接触面積</div>
+                    <div class="analysis-value">0.65 mm²</div>
+                </div>
+                <div class="analysis-box">
+                    <div class="analysis-label">接触点数</div>
+                    <div class="analysis-value">18</div>
+                </div>
+            </div>
+            
+            <table>
+                <tr>
+                    <th>領域</th>
+                    <th>接触面積 (mm²)</th>
+                    <th>比率</th>
+                </tr>
+                <tr>
+                    <td>前歯部</td>
+                    <td>0.49</td>
+                    <td>76.6%</td>
+                </tr>
+                <tr>
+                    <td>臼歯部</td>
+                    <td>0.15</td>
+                    <td>23.4%</td>
+                </tr>
+                <tr>
+                    <td>左側</td>
+                    <td>0.42</td>
+                    <td>65.8%</td>
+                </tr>
+                <tr>
+                    <td>右側</td>
+                    <td>0.22</td>
+                    <td>34.2%</td>
+                </tr>
+            </table>
+            
+            <div style="margin-top: 20px;">
+                <strong>バランス評価:</strong>
+                <div style="margin: 10px 0;">
+                    前後バランス: 30.6%
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: 30.585761571153398%"></div>
+                    </div>
+                </div>
+                <div style="margin: 10px 0;">
+                    左右バランス: 52.1%
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: 52.05029809424035%"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="candidate">
+            <div class="candidate-header">
+                <div class="candidate-title">候補 2 - 摂動位置 5</div>
+                <span class="badge badge-rank">候補 #2</span>
+            </div>
+            
+            <div class="params-grid">
+                <div class="param-box">
+                    <div class="param-label">水平移動 X</div>
+                    <div class="param-value">0.042 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">水平移動 Y</div>
+                    <div class="param-value">-0.020 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">垂直移動 Z</div>
+                    <div class="param-value">0.002 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">回転 X軸</div>
+                    <div class="param-value">1.29°</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">回転 Y軸</div>
+                    <div class="param-value">1.00°</div>
+                </div>
+            </div>
+            
+            <div class="analysis-grid">
+                <div class="analysis-box">
+                    <div class="analysis-label">総合スコア</div>
+                    <div class="analysis-value">0.96</div>
+                </div>
+                <div class="analysis-box">
+                    <div class="analysis-label">総接触面積</div>
+                    <div class="analysis-value">0.66 mm²</div>
+                </div>
+                <div class="analysis-box">
+                    <div class="analysis-label">接触点数</div>
+                    <div class="analysis-value">19</div>
+                </div>
+            </div>
+            
+            <table>
+                <tr>
+                    <th>領域</th>
+                    <th>接触面積 (mm²)</th>
+                    <th>比率</th>
+                </tr>
+                <tr>
+                    <td>前歯部</td>
+                    <td>0.39</td>
+                    <td>58.6%</td>
+                </tr>
+                <tr>
+                    <td>臼歯部</td>
+                    <td>0.27</td>
+                    <td>41.4%</td>
+                </tr>
+                <tr>
+                    <td>左側</td>
+                    <td>0.03</td>
+                    <td>4.8%</td>
+                </tr>
+                <tr>
+                    <td>右側</td>
+                    <td>0.63</td>
+                    <td>95.2%</td>
+                </tr>
+            </table>
+            
+            <div style="margin-top: 20px;">
+                <strong>バランス評価:</strong>
+                <div style="margin: 10px 0;">
+                    前後バランス: 70.6%
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: 70.55864581826586%"></div>
+                    </div>
+                </div>
+                <div style="margin: 10px 0;">
+                    左右バランス: 5.0%
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: 5.004006309781777%"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="candidate">
+            <div class="candidate-header">
+                <div class="candidate-title">候補 3 - 摂動位置 9</div>
+                <span class="badge badge-rank">候補 #3</span>
+            </div>
+            
+            <div class="params-grid">
+                <div class="param-box">
+                    <div class="param-label">水平移動 X</div>
+                    <div class="param-value">-0.025 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">水平移動 Y</div>
+                    <div class="param-value">0.133 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">垂直移動 Z</div>
+                    <div class="param-value">0.016 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">回転 X軸</div>
+                    <div class="param-value">0.80°</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">回転 Y軸</div>
+                    <div class="param-value">-0.75°</div>
+                </div>
+            </div>
+            
+            <div class="analysis-grid">
+                <div class="analysis-box">
+                    <div class="analysis-label">総合スコア</div>
+                    <div class="analysis-value">0.89</div>
+                </div>
+                <div class="analysis-box">
+                    <div class="analysis-label">総接触面積</div>
+                    <div class="analysis-value">0.59 mm²</div>
+                </div>
+                <div class="analysis-box">
+                    <div class="analysis-label">接触点数</div>
+                    <div class="analysis-value">20</div>
+                </div>
+            </div>
+            
+            <table>
+                <tr>
+                    <th>領域</th>
+                    <th>接触面積 (mm²)</th>
+                    <th>比率</th>
+                </tr>
+                <tr>
+                    <td>前歯部</td>
+                    <td>0.27</td>
+                    <td>45.4%</td>
+                </tr>
+                <tr>
+                    <td>臼歯部</td>
+                    <td>0.32</td>
+                    <td>54.6%</td>
+                </tr>
+                <tr>
+                    <td>左側</td>
+                    <td>0.52</td>
+                    <td>88.1%</td>
+                </tr>
+                <tr>
+                    <td>右側</td>
+                    <td>0.07</td>
+                    <td>11.9%</td>
+                </tr>
+            </table>
+            
+            <div style="margin-top: 20px;">
+                <strong>バランス評価:</strong>
+                <div style="margin: 10px 0;">
+                    前後バランス: 83.1%
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: 83.0698142678568%"></div>
+                    </div>
+                </div>
+                <div style="margin: 10px 0;">
+                    左右バランス: 13.5%
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: 13.501730552970374%"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="candidate">
+            <div class="candidate-header">
+                <div class="candidate-title">候補 4 - 摂動位置 1</div>
+                <span class="badge badge-rank">候補 #4</span>
+            </div>
+            
+            <div class="params-grid">
+                <div class="param-box">
+                    <div class="param-label">水平移動 X</div>
+                    <div class="param-value">0.110 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">水平移動 Y</div>
+                    <div class="param-value">-0.024 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">垂直移動 Z</div>
+                    <div class="param-value">-0.131 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">回転 X軸</div>
+                    <div class="param-value">1.43°</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">回転 Y軸</div>
+                    <div class="param-value">0.79°</div>
+                </div>
+            </div>
+            
+            <div class="analysis-grid">
+                <div class="analysis-box">
+                    <div class="analysis-label">総合スコア</div>
+                    <div class="analysis-value">1.10</div>
+                </div>
+                <div class="analysis-box">
+                    <div class="analysis-label">総接触面積</div>
+                    <div class="analysis-value">0.91 mm²</div>
+                </div>
+                <div class="analysis-box">
+                    <div class="analysis-label">接触点数</div>
+                    <div class="analysis-value">26</div>
+                </div>
+            </div>
+            
+            <table>
+                <tr>
+                    <th>領域</th>
+                    <th>接触面積 (mm²)</th>
+                    <th>比率</th>
+                </tr>
+                <tr>
+                    <td>前歯部</td>
+                    <td>0.32</td>
+                    <td>34.7%</td>
+                </tr>
+                <tr>
+                    <td>臼歯部</td>
+                    <td>0.60</td>
+                    <td>65.3%</td>
+                </tr>
+                <tr>
+                    <td>左側</td>
+                    <td>0.16</td>
+                    <td>17.0%</td>
+                </tr>
+                <tr>
+                    <td>右側</td>
+                    <td>0.76</td>
+                    <td>83.0%</td>
+                </tr>
+            </table>
+            
+            <div style="margin-top: 20px;">
+                <strong>バランス評価:</strong>
+                <div style="margin: 10px 0;">
+                    前後バランス: 53.1%
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: 53.10637718093809%"></div>
+                    </div>
+                </div>
+                <div style="margin: 10px 0;">
+                    左右バランス: 20.5%
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: 20.488827541853574%"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="candidate">
+            <div class="candidate-header">
+                <div class="candidate-title">候補 5 - 摂動位置 3</div>
+                <span class="badge badge-rank">候補 #5</span>
+            </div>
+            
+            <div class="params-grid">
+                <div class="param-box">
+                    <div class="param-label">水平移動 X</div>
+                    <div class="param-value">-0.052 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">水平移動 Y</div>
+                    <div class="param-value">0.171 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">垂直移動 Z</div>
+                    <div class="param-value">-0.061 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">回転 X軸</div>
+                    <div class="param-value">0.58°</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">回転 Y軸</div>
+                    <div class="param-value">1.29°</div>
+                </div>
+            </div>
+            
+            <div class="analysis-grid">
+                <div class="analysis-box">
+                    <div class="analysis-label">総合スコア</div>
+                    <div class="analysis-value">0.86</div>
+                </div>
+                <div class="analysis-box">
+                    <div class="analysis-label">総接触面積</div>
+                    <div class="analysis-value">0.92 mm²</div>
+                </div>
+                <div class="analysis-box">
+                    <div class="analysis-label">接触点数</div>
+                    <div class="analysis-value">34</div>
+                </div>
+            </div>
+            
+            <table>
+                <tr>
+                    <th>領域</th>
+                    <th>接触面積 (mm²)</th>
+                    <th>比率</th>
+                </tr>
+                <tr>
+                    <td>前歯部</td>
+                    <td>0.62</td>
+                    <td>66.7%</td>
+                </tr>
+                <tr>
+                    <td>臼歯部</td>
+                    <td>0.31</td>
+                    <td>33.3%</td>
+                </tr>
+                <tr>
+                    <td>左側</td>
+                    <td>0.04</td>
+                    <td>4.0%</td>
+                </tr>
+                <tr>
+                    <td>右側</td>
+                    <td>0.89</td>
+                    <td>96.0%</td>
+                </tr>
+            </table>
+            
+            <div style="margin-top: 20px;">
+                <strong>バランス評価:</strong>
+                <div style="margin: 10px 0;">
+                    前後バランス: 49.8%
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: 49.81329201272318%"></div>
+                    </div>
+                </div>
+                <div style="margin: 10px 0;">
+                    左右バランス: 4.1%
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: 4.120293847299064%"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="candidate">
+            <div class="candidate-header">
+                <div class="candidate-title">候補 6 - 摂動位置 2</div>
+                <span class="badge badge-rank">候補 #6</span>
+            </div>
+            
+            <div class="params-grid">
+                <div class="param-box">
+                    <div class="param-label">水平移動 X</div>
+                    <div class="param-value">0.190 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">水平移動 Y</div>
+                    <div class="param-value">0.104 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">垂直移動 Z</div>
+                    <div class="param-value">-0.060 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">回転 X軸</div>
+                    <div class="param-value">1.14°</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">回転 Y軸</div>
+                    <div class="param-value">-1.49°</div>
+                </div>
+            </div>
+            
+            <div class="analysis-grid">
+                <div class="analysis-box">
+                    <div class="analysis-label">総合スコア</div>
+                    <div class="analysis-value">0.65</div>
+                </div>
+                <div class="analysis-box">
+                    <div class="analysis-label">総接触面積</div>
+                    <div class="analysis-value">0.84 mm²</div>
+                </div>
+                <div class="analysis-box">
+                    <div class="analysis-label">接触点数</div>
+                    <div class="analysis-value">30</div>
+                </div>
+            </div>
+            
+            <table>
+                <tr>
+                    <th>領域</th>
+                    <th>接触面積 (mm²)</th>
+                    <th>比率</th>
+                </tr>
+                <tr>
+                    <td>前歯部</td>
+                    <td>0.71</td>
+                    <td>83.7%</td>
+                </tr>
+                <tr>
+                    <td>臼歯部</td>
+                    <td>0.14</td>
+                    <td>16.3%</td>
+                </tr>
+                <tr>
+                    <td>左側</td>
+                    <td>0.75</td>
+                    <td>89.1%</td>
+                </tr>
+                <tr>
+                    <td>右側</td>
+                    <td>0.09</td>
+                    <td>10.9%</td>
+                </tr>
+            </table>
+            
+            <div style="margin-top: 20px;">
+                <strong>バランス評価:</strong>
+                <div style="margin: 10px 0;">
+                    前後バランス: 19.4%
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: 19.4225179843864%"></div>
+                    </div>
+                </div>
+                <div style="margin: 10px 0;">
+                    左右バランス: 12.2%
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: 12.225649943570039%"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="candidate">
+            <div class="candidate-header">
+                <div class="candidate-title">候補 7 - 摂動位置 6</div>
+                <span class="badge badge-rank">候補 #7</span>
+            </div>
+            
+            <div class="params-grid">
+                <div class="param-box">
+                    <div class="param-label">水平移動 X</div>
+                    <div class="param-value">-0.122 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">水平移動 Y</div>
+                    <div class="param-value">-0.013 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">垂直移動 Z</div>
+                    <div class="param-value">-0.013 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">回転 X軸</div>
+                    <div class="param-value">-1.82°</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">回転 Y軸</div>
+                    <div class="param-value">-1.38°</div>
+                </div>
+            </div>
+            
+            <div class="analysis-grid">
+                <div class="analysis-box">
+                    <div class="analysis-label">総合スコア</div>
+                    <div class="analysis-value">0.39</div>
+                </div>
+                <div class="analysis-box">
+                    <div class="analysis-label">総接触面積</div>
+                    <div class="analysis-value">0.51 mm²</div>
+                </div>
+                <div class="analysis-box">
+                    <div class="analysis-label">接触点数</div>
+                    <div class="analysis-value">20</div>
+                </div>
+            </div>
+            
+            <table>
+                <tr>
+                    <th>領域</th>
+                    <th>接触面積 (mm²)</th>
+                    <th>比率</th>
+                </tr>
+                <tr>
+                    <td>前歯部</td>
+                    <td>0.37</td>
+                    <td>72.3%</td>
+                </tr>
+                <tr>
+                    <td>臼歯部</td>
+                    <td>0.14</td>
+                    <td>27.7%</td>
+                </tr>
+                <tr>
+                    <td>左側</td>
+                    <td>0.51</td>
+                    <td>100.0%</td>
+                </tr>
+                <tr>
+                    <td>右側</td>
+                    <td>0.00</td>
+                    <td>0.0%</td>
+                </tr>
+            </table>
+            
+            <div style="margin-top: 20px;">
+                <strong>バランス評価:</strong>
+                <div style="margin: 10px 0;">
+                    前後バランス: 38.3%
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: 38.28209811038627%"></div>
+                    </div>
+                </div>
+                <div style="margin: 10px 0;">
+                    左右バランス: 0.0%
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: 0.0%"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="candidate">
+            <div class="candidate-header">
+                <div class="candidate-title">候補 8 - 摂動位置 7</div>
+                <span class="badge badge-rank">候補 #8</span>
+            </div>
+            
+            <div class="params-grid">
+                <div class="param-box">
+                    <div class="param-label">水平移動 X</div>
+                    <div class="param-value">0.098 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">水平移動 Y</div>
+                    <div class="param-value">0.187 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">垂直移動 Z</div>
+                    <div class="param-value">-0.056 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">回転 X軸</div>
+                    <div class="param-value">-0.70°</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">回転 Y軸</div>
+                    <div class="param-value">-0.52°</div>
+                </div>
+            </div>
+            
+            <div class="analysis-grid">
+                <div class="analysis-box">
+                    <div class="analysis-label">総合スコア</div>
+                    <div class="analysis-value">0.53</div>
+                </div>
+                <div class="analysis-box">
+                    <div class="analysis-label">総接触面積</div>
+                    <div class="analysis-value">0.46 mm²</div>
+                </div>
+                <div class="analysis-box">
+                    <div class="analysis-label">接触点数</div>
+                    <div class="analysis-value">20</div>
+                </div>
+            </div>
+            
+            <table>
+                <tr>
+                    <th>領域</th>
+                    <th>接触面積 (mm²)</th>
+                    <th>比率</th>
+                </tr>
+                <tr>
+                    <td>前歯部</td>
+                    <td>0.34</td>
+                    <td>73.9%</td>
+                </tr>
+                <tr>
+                    <td>臼歯部</td>
+                    <td>0.12</td>
+                    <td>26.1%</td>
+                </tr>
+                <tr>
+                    <td>左側</td>
+                    <td>0.33</td>
+                    <td>71.4%</td>
+                </tr>
+                <tr>
+                    <td>右側</td>
+                    <td>0.13</td>
+                    <td>28.6%</td>
+                </tr>
+            </table>
+            
+            <div style="margin-top: 20px;">
+                <strong>バランス評価:</strong>
+                <div style="margin: 10px 0;">
+                    前後バランス: 35.3%
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: 35.29810328315367%"></div>
+                    </div>
+                </div>
+                <div style="margin: 10px 0;">
+                    左右バランス: 40.1%
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: 40.06270142157549%"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="candidate">
+            <div class="candidate-header">
+                <div class="candidate-title">候補 9 - 摂動位置 8</div>
+                <span class="badge badge-rank">候補 #9</span>
+            </div>
+            
+            <div class="params-grid">
+                <div class="param-box">
+                    <div class="param-label">水平移動 X</div>
+                    <div class="param-value">-0.124 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">水平移動 Y</div>
+                    <div class="param-value">-0.148 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">垂直移動 Z</div>
+                    <div class="param-value">-0.016 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">回転 X軸</div>
+                    <div class="param-value">-0.10°</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">回転 Y軸</div>
+                    <div class="param-value">-1.09°</div>
+                </div>
+            </div>
+            
+            <div class="analysis-grid">
+                <div class="analysis-box">
+                    <div class="analysis-label">総合スコア</div>
+                    <div class="analysis-value">0.30</div>
+                </div>
+                <div class="analysis-box">
+                    <div class="analysis-label">総接触面積</div>
+                    <div class="analysis-value">0.40 mm²</div>
+                </div>
+                <div class="analysis-box">
+                    <div class="analysis-label">接触点数</div>
+                    <div class="analysis-value">18</div>
+                </div>
+            </div>
+            
+            <table>
+                <tr>
+                    <th>領域</th>
+                    <th>接触面積 (mm²)</th>
+                    <th>比率</th>
+                </tr>
+                <tr>
+                    <td>前歯部</td>
+                    <td>0.25</td>
+                    <td>63.8%</td>
+                </tr>
+                <tr>
+                    <td>臼歯部</td>
+                    <td>0.14</td>
+                    <td>36.2%</td>
+                </tr>
+                <tr>
+                    <td>左側</td>
+                    <td>0.40</td>
+                    <td>100.0%</td>
+                </tr>
+                <tr>
+                    <td>右側</td>
+                    <td>0.00</td>
+                    <td>0.0%</td>
+                </tr>
+            </table>
+            
+            <div style="margin-top: 20px;">
+                <strong>バランス評価:</strong>
+                <div style="margin: 10px 0;">
+                    前後バランス: 56.7%
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: 56.65354109339161%"></div>
+                    </div>
+                </div>
+                <div style="margin: 10px 0;">
+                    左右バランス: 0.0%
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: 0.0%"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="candidate">
+            <div class="candidate-header">
+                <div class="candidate-title">候補 10 - 摂動位置 11</div>
+                <span class="badge badge-rank">候補 #10</span>
+            </div>
+            
+            <div class="params-grid">
+                <div class="param-box">
+                    <div class="param-label">水平移動 X</div>
+                    <div class="param-value">-0.120 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">水平移動 Y</div>
+                    <div class="param-value">-0.197 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">垂直移動 Z</div>
+                    <div class="param-value">-0.009 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">回転 X軸</div>
+                    <div class="param-value">1.15°</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">回転 Y軸</div>
+                    <div class="param-value">0.66°</div>
+                </div>
+            </div>
+            
+            <div class="analysis-grid">
+                <div class="analysis-box">
+                    <div class="analysis-label">総合スコア</div>
+                    <div class="analysis-value">0.29</div>
+                </div>
+                <div class="analysis-box">
+                    <div class="analysis-label">総接触面積</div>
+                    <div class="analysis-value">0.33 mm²</div>
+                </div>
+                <div class="analysis-box">
+                    <div class="analysis-label">接触点数</div>
+                    <div class="analysis-value">18</div>
+                </div>
+            </div>
+            
+            <table>
+                <tr>
+                    <th>領域</th>
+                    <th>接触面積 (mm²)</th>
+                    <th>比率</th>
+                </tr>
+                <tr>
+                    <td>前歯部</td>
+                    <td>0.17</td>
+                    <td>51.8%</td>
+                </tr>
+                <tr>
+                    <td>臼歯部</td>
+                    <td>0.16</td>
+                    <td>48.2%</td>
+                </tr>
+                <tr>
+                    <td>左側</td>
+                    <td>0.02</td>
+                    <td>5.6%</td>
+                </tr>
+                <tr>
+                    <td>右側</td>
+                    <td>0.31</td>
+                    <td>94.4%</td>
+                </tr>
+            </table>
+            
+            <div style="margin-top: 20px;">
+                <strong>バランス評価:</strong>
+                <div style="margin: 10px 0;">
+                    前後バランス: 93.2%
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: 93.22003015244672%"></div>
+                    </div>
+                </div>
+                <div style="margin: 10px 0;">
+                    左右バランス: 5.9%
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: 5.9062690280410814%"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="candidate">
+            <div class="candidate-header">
+                <div class="candidate-title">候補 11 - 摂動位置 4</div>
+                <span class="badge badge-rank">候補 #11</span>
+            </div>
+            
+            <div class="params-grid">
+                <div class="param-box">
+                    <div class="param-label">水平移動 X</div>
+                    <div class="param-value">-0.109 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">水平移動 Y</div>
+                    <div class="param-value">0.022 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">垂直移動 Z</div>
+                    <div class="param-value">-0.024 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">回転 X軸</div>
+                    <div class="param-value">-1.74°</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">回転 Y軸</div>
+                    <div class="param-value">1.31°</div>
+                </div>
+            </div>
+            
+            <div class="analysis-grid">
+                <div class="analysis-box">
+                    <div class="analysis-label">総合スコア</div>
+                    <div class="analysis-value">0.28</div>
+                </div>
+                <div class="analysis-box">
+                    <div class="analysis-label">総接触面積</div>
+                    <div class="analysis-value">0.43 mm²</div>
+                </div>
+                <div class="analysis-box">
+                    <div class="analysis-label">接触点数</div>
+                    <div class="analysis-value">20</div>
+                </div>
+            </div>
+            
+            <table>
+                <tr>
+                    <th>領域</th>
+                    <th>接触面積 (mm²)</th>
+                    <th>比率</th>
+                </tr>
+                <tr>
+                    <td>前歯部</td>
+                    <td>0.32</td>
+                    <td>74.3%</td>
+                </tr>
+                <tr>
+                    <td>臼歯部</td>
+                    <td>0.11</td>
+                    <td>25.7%</td>
+                </tr>
+                <tr>
+                    <td>左側</td>
+                    <td>0.00</td>
+                    <td>0.0%</td>
+                </tr>
+                <tr>
+                    <td>右側</td>
+                    <td>0.43</td>
+                    <td>100.0%</td>
+                </tr>
+            </table>
+            
+            <div style="margin-top: 20px;">
+                <strong>バランス評価:</strong>
+                <div style="margin: 10px 0;">
+                    前後バランス: 34.7%
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: 34.65602392108229%"></div>
+                    </div>
+                </div>
+                <div style="margin: 10px 0;">
+                    左右バランス: 0.0%
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: 0.0%"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="candidate">
+            <div class="candidate-header">
+                <div class="candidate-title">候補 12 - 摂動位置 10</div>
+                <span class="badge badge-rank">候補 #12</span>
+            </div>
+            
+            <div class="params-grid">
+                <div class="param-box">
+                    <div class="param-label">水平移動 X</div>
+                    <div class="param-value">-0.068 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">水平移動 Y</div>
+                    <div class="param-value">0.025 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">垂直移動 Z</div>
+                    <div class="param-value">0.223 mm</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">回転 X軸</div>
+                    <div class="param-value">0.95°</div>
+                </div>
+                <div class="param-box">
+                    <div class="param-label">回転 Y軸</div>
+                    <div class="param-value">-1.03°</div>
+                </div>
+            </div>
+            
+            <div class="analysis-grid">
+                <div class="analysis-box">
+                    <div class="analysis-label">総合スコア</div>
+                    <div class="analysis-value">0.12</div>
+                </div>
+                <div class="analysis-box">
+                    <div class="analysis-label">総接触面積</div>
+                    <div class="analysis-value">0.27 mm²</div>
+                </div>
+                <div class="analysis-box">
+                    <div class="analysis-label">接触点数</div>
+                    <div class="analysis-value">10</div>
+                </div>
+            </div>
+            
+            <table>
+                <tr>
+                    <th>領域</th>
+                    <th>接触面積 (mm²)</th>
+                    <th>比率</th>
+                </tr>
+                <tr>
+                    <td>前歯部</td>
+                    <td>0.16</td>
+                    <td>59.7%</td>
+                </tr>
+                <tr>
+                    <td>臼歯部</td>
+                    <td>0.11</td>
+                    <td>40.3%</td>
+                </tr>
+                <tr>
+                    <td>左側</td>
+                    <td>0.27</td>
+                    <td>100.0%</td>
+                </tr>
+                <tr>
+                    <td>右側</td>
+                    <td>0.00</td>
+                    <td>0.0%</td>
+                </tr>
+            </table>
+            
+            <div style="margin-top: 20px;">
+                <strong>バランス評価:</strong>
+                <div style="margin: 10px 0;">
+                    前後バランス: 67.5%
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: 67.50247287798746%"></div>
+                    </div>
+                </div>
+                <div style="margin: 10px 0;">
+                    左右バランス: 0.0%
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: 0.0%"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="footer">
+            <p>💡 このレポートは自動生成されています。臨床判断は歯科医師が行ってください。</p>
+            <p>Shibuya Dental Laboratory | Digital Occlusion Analysis System v2.0 (fast)</p>
+        </div>
+    </div>
+</body>
+</html>
