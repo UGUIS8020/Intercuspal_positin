@@ -466,9 +466,22 @@ def calculate_elastic_rubber_score(analysis, config):
     if len(contact_points) == 0:
         return -1000.0
     
+    # contact_pointsを適切な配列に変換
+    try:
+        if isinstance(contact_points, list) and len(contact_points) > 0:
+            # タプルのリストを配列に変換
+            contact_array = np.array([[float(p[0]), float(p[1]), float(p[2])] for p in contact_points])
+        else:
+            contact_array = np.array(contact_points)
+        
+        if contact_array.size == 0 or contact_array.shape[0] == 0:
+            return -1000.0
+    except (IndexError, TypeError, ValueError) as e:
+        return -1000.0  # データ変換エラーの場合
+    
     # 中心座標計算
-    center_x = np.mean(contact_points[:, 0])
-    center_y = np.mean(contact_points[:, 1])
+    center_x = np.mean(contact_array[:, 0])
+    center_y = np.mean(contact_array[:, 1])
     
     # 8方向（上下左右+斜め4方向）の分布を計算
     angles = np.linspace(0, 2*np.pi, 8, endpoint=False)
@@ -479,7 +492,7 @@ def calculate_elastic_rubber_score(analysis, config):
         direction = np.array([np.cos(angle), np.sin(angle)])
         
         # 各接触点がこの方向に投影される値
-        relative_points = contact_points[:, :2] - np.array([center_x, center_y])
+        relative_points = contact_array[:, :2] - np.array([center_x, center_y])
         projections = np.dot(relative_points, direction)
         
         # この方向の正の側にある接触点の面積
