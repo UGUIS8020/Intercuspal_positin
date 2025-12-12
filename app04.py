@@ -181,16 +181,17 @@ class OptimizationConfig:
             "ROTATION_PENALTY": 0.6,         # 回転を大幅に柔軟化
             "TRANSLATION_PENALTY": 0.9,      # 移動を柔軟化で分布改善
         },
-        # ★★★★★★★ 輪ゴム最適化モード（全方向均等弾性力）
+        # ★★★★★★★ 輪ゴム最適化モード（app.pyの成功パターン適用）
         "輪ゴム最適化": {
-            "CONTACT_THRESHOLD": 0.05,       # 最大範囲接触検出
-            "TIGHT_THRESHOLD": 0.025,        # 全方向からの弾性力を模擬
-            "BALANCE_AP_WEIGHT": 3.0,        # 縦方向の輪ゴム効果
-            "BALANCE_LR_WEIGHT": 3.0,        # 横方向の輪ゴム効果  
+            "CONTACT_THRESHOLD": 0.03,       # app.pyと同じ閾値
+            "TIGHT_THRESHOLD": 0.015,        
+            "BALANCE_AP_WEIGHT": 0.4,        # app.pyスタイルでは使用しない
+            "BALANCE_LR_WEIGHT": 0.4,        # app.pyスタイルでは使用しない 
             "PENETRATION_PENALTY": 0.1,      # 弾性変形を許容
-            "ROTATION_PENALTY": 0.3,         # 自然な回転を許可
-            "TRANSLATION_PENALTY": 0.5,      # 弾性収束を促進
-            "description": "上下顎を輪ゴムで縦横にぐるぐる巻きにした時の全方向均等弾性力を模擬"
+            "ROTATION_PENALTY": 1.5,         # app.pyと同じ
+            "TRANSLATION_PENALTY": 2.0,      # app.pyと同じ
+            "ELASTIC_FORCE_MODE": True,      # 輪ゴム最適化フラグ
+            "description": "app.pyの5本輪ゴムバネモデル：最弱点重視で全体均等化"
         },
     }
     
@@ -252,11 +253,11 @@ class OptimizationConfig:
             self.NUM_MULTISTART = 12         # 大量候補生成で最適解発見
             self.MAX_LBFGS_ITER = 150        # 最高精度最適化
         elif preset == "輪ゴム最適化":
-            # 輪ゴム最適化モード：全方向均等弾性力による収束
-            self.SAMPLE_SIZE = 4000          # 最大精度サンプリング
-            self.MAX_CLOSE_STEPS = 60        # 弾性的段階接近
-            self.NUM_MULTISTART = 15         # 多方向からの収束試行
-            self.MAX_LBFGS_ITER = 200        # 弾性最適化の精度向上
+            # 輪ゴム最適化モード：app.pyの5本バネモデル適用
+            self.SAMPLE_SIZE = 1200          # app.pyと同じサンプリング数
+            self.MAX_CLOSE_STEPS = 30        # シンプルな段階接近
+            self.NUM_MULTISTART = 8          # 適度な候補数
+            self.MAX_LBFGS_ITER = 100        # app.pyスタイルの最適化
             self.ELASTIC_FORCE_MODE = True   # 輪ゴム弾性力有効化
         else:
             # 高精度モード：接触分析の精度を向上
@@ -298,6 +299,45 @@ class ContactAnalyzer:
         self.y_mid = y_mid
         self.config = config
         self.use_gpu = getattr(config, 'USE_GPU', False)
+        
+        # 従来の4分割マスク
+        self.left_mask = sample_vertices[:, 0] <= x_mid
+        self.right_mask = sample_vertices[:, 0] > x_mid
+        self.anterior_mask = sample_vertices[:, 1] > y_mid
+        self.posterior_mask = sample_vertices[:, 1] <= y_mid
+        
+        # app.pyの成功パターン：5ブロック分割（輪ゴムモデル）
+        x = sample_vertices[:, 0]
+        y = sample_vertices[:, 1]
+        y_min, y_max = float(y.min()), float(y.max())
+        
+        if y_max == y_min:
+            y_cut1 = y_min - 0.1
+            y_cut2 = y_min + 0.1
+        else:
+            dy = y_max - y_min
+            y_cut1 = y_min + dy / 3.0        # 大臼歯 / 小臼歯の境
+            y_cut2 = y_min + dy * 2.0 / 3.0  # 小臼歯 / 前歯の境
+
+        is_left = x <= x_mid
+        is_right = ~is_left
+        band_molar = y <= y_cut1
+        band_premolar = (y > y_cut1) & (y <= y_cut2)
+        band_ant = y > y_cut2
+
+        # 5つの輪ゴムブロック
+        self.spring_masks = {
+            "M_L": is_left & band_molar,      # 左大臼歯
+            "M_R": is_right & band_molar,     # 右大臼歯
+            "PM_L": is_left & band_premolar,  # 左小臼歯
+            "PM_R": is_right & band_premolar, # 右小臼歯
+            "ANT": band_ant,                  # 前歯（左右まとめて）
+        }
+        
+        # 実際に頂点が存在するブロックだけを有効とする
+        self.valid_springs = [
+            name for name, mask in self.spring_masks.items() if np.any(mask)
+        ]
         
         # GPU用データの事前転送
         if self.use_gpu and GPU_AVAILABLE:
@@ -411,13 +451,26 @@ class ContactAnalyzer:
         # 右側咬合不足ペナルティ
         lr_imbalance = abs(analysis['left_area'] - analysis['right_area'])
         
-        # 輪ゴム最適化モード：全方向均等圧力を簡易模擬
+        # 輪ゴム最適化モード：app.pyの成功パターンを適用
         if hasattr(self.config, 'ELASTIC_FORCE_MODE') and self.config.ELASTIC_FORCE_MODE:
-            # 輪ゴム効果：前後・左右バランスを極端に重視（縦横に締めつける効果）
-            elastic_balance = (analysis['ap_balance'] + analysis['lr_balance']) / 2.0
-            # 理想的な50:50バランスに近いほど高スコア
-            rubber_factor = 1.0 + (elastic_balance * 5.0)  # 均等性を5倍重視
-            analysis['score'] = analysis['total_area'] * rubber_factor - lr_imbalance * 2.0
+            # 5本の輪ゴムバネスコア計算
+            spring_scores = self.calculate_spring_scores(analysis)
+            if len(spring_scores) > 0:
+                min_spring = float(np.min(spring_scores))     # 最弱バネを重視（app.pyの成功要因！）
+                var_spring = float(np.var(spring_scores))     # バラつきを減点
+                total_spring = float(np.sum(spring_scores))   # 全体の強度
+                zero_springs = int(np.sum(np.array(spring_scores) < 1e-6))  # 死んでるバネ数
+                
+                # app.pyの成功式を適用
+                analysis['score'] = (
+                    0.4 * total_spring +      # 全体として噛んでいるか
+                    1.4 * min_spring +        # 一番弱いバネも張っているか（重要！）
+                    - 0.3 * var_spring +      # バラつきを減点
+                    - 0.8 * zero_springs -    # 死んでるバネを減点
+                    rot_penalty - trans_penalty
+                )
+            else:
+                analysis['score'] = -1000.0  # バネがない場合は最低スコア
         else:
             analysis['score'] = (
                 analysis['total_area']
@@ -431,6 +484,45 @@ class ContactAnalyzer:
             )
         
         return analysis
+    
+    def calculate_spring_scores(self, analysis):
+        """app.pyの5本輪ゴムバネスコア計算"""
+        try:
+            contact_points = analysis.get('contact_points', [])
+            if len(contact_points) == 0:
+                return []
+            
+            # 接触している頂点のマスクを作成
+            contact_mask = analysis.get('contact_mask', np.array([]))
+            if len(contact_mask) == 0:
+                return []
+            
+            # 各バネブロックのスコアを計算
+            spring_scores = []
+            for name in self.valid_springs:
+                mask = self.spring_masks[name]
+                # このブロック内で接触している頂点の数と面積
+                block_contact_mask = mask & contact_mask
+                if np.any(block_contact_mask):
+                    # app.pyスタイル：面積×重み
+                    block_area = float(self.sample_areas[block_contact_mask].sum())
+                    # 距離による重み付け（簡易版）
+                    distances = analysis.get('distances', np.zeros_like(mask, dtype=float))
+                    block_distances = distances[block_contact_mask]
+                    if len(block_distances) > 0:
+                        th = self.config.CONTACT_THRESHOLD
+                        weights = 1.0 - (np.clip(block_distances, 0.0, th) / th) ** 2
+                        weighted_area = block_area * np.mean(weights)
+                    else:
+                        weighted_area = block_area
+                    spring_scores.append(weighted_area)
+                else:
+                    spring_scores.append(0.0)
+                
+            return spring_scores
+            
+        except Exception as e:
+            return []
     
     def _create_empty_analysis(self):
         """エラー時の空の分析結果を作成"""
@@ -457,88 +549,7 @@ class ContactAnalyzer:
         translation_gpu = cp.asarray([tx, ty, tz])
         return cp.dot(self.sample_vertices_gpu, rot_gpu.T) + translation_gpu
 
-def calculate_elastic_rubber_score(analysis, config):
-    """輪ゴム弾性力を模擬したスコア計算（全方向均等圧力）"""
-    if analysis['total_area'] == 0:
-        return -1000.0  # 接触がない場合は最低スコア
-    
-    # 基本的な接触評価
-    base_score = analysis['total_area']
-    
-    # 8方向セクター分析（輪ゴムが縦横に巻かれた状態を模擬）
-    contact_points = analysis['contact_points']
-    if len(contact_points) == 0:
-        return -1000.0
-    
-    # contact_pointsを適切な配列に変換
-    try:
-        if isinstance(contact_points, list) and len(contact_points) > 0:
-            # タプルのリストを配列に変換
-            contact_array = np.array([[float(p[0]), float(p[1]), float(p[2])] for p in contact_points])
-        else:
-            contact_array = np.array(contact_points)
-        
-        if contact_array.size == 0 or contact_array.shape[0] == 0:
-            return -1000.0
-    except (IndexError, TypeError, ValueError) as e:
-        return -1000.0  # データ変換エラーの場合
-    
-    # 中心座標計算
-    center_x = np.mean(contact_array[:, 0])
-    center_y = np.mean(contact_array[:, 1])
-    
-    # 8方向（上下左右+斜め4方向）の分布を計算
-    angles = np.linspace(0, 2*np.pi, 8, endpoint=False)
-    sector_areas = []
-    
-    for angle in angles:
-        # 各セクターの方向ベクトル
-        direction = np.array([np.cos(angle), np.sin(angle)])
-        
-        # 各接触点がこの方向に投影される値
-        relative_points = contact_array[:, :2] - np.array([center_x, center_y])
-        projections = np.dot(relative_points, direction)
-        
-        # この方向の正の側にある接触点の面積
-        positive_mask = projections > 0
-        if np.any(positive_mask):
-            # ここでは簡易的に接触点数を面積として扱う
-            sector_area = np.sum(positive_mask) / contact_array.shape[0]
-        else:
-            sector_area = 0.0
-        
-        sector_areas.append(sector_area)
-    
-    # 輪ゴム効果：全方向が理想的に0.5（50%）に近いほど高スコア
-    ideal_ratio = 0.5
-    sector_deviations = [abs(area - ideal_ratio) for area in sector_areas]
-    uniformity_score = 1.0 - np.mean(sector_deviations)
-    
-    # 弾性収束効果：接触点の分散が小さいほど（まとまっているほど）良い
-    if contact_array.shape[0] > 1:
-        distances_from_center = np.linalg.norm(
-            contact_array[:, :2] - np.array([center_x, center_y]), axis=1
-        )
-        distance_std = np.std(distances_from_center)
-        distance_mean = np.mean(distances_from_center)
-        compactness_score = 1.0 / (1.0 + distance_std / (distance_mean + 1e-6))
-    else:
-        compactness_score = 1.0
-    
-    # 輪ゴムの縦横効果（従来の前後左右バランス強化）
-    ap_balance = min(analysis['anterior_area'], analysis['posterior_area']) / (max(analysis['anterior_area'], analysis['posterior_area']) + 1e-6)
-    lr_balance = min(analysis['left_area'], analysis['right_area']) / (max(analysis['left_area'], analysis['right_area']) + 1e-6)
-    
-    # 総合輪ゴムスコア
-    rubber_score = (
-        base_score +
-        config.BALANCE_AP_WEIGHT * ap_balance * 2.0 +  # 縦方向の輪ゴム
-        config.BALANCE_LR_WEIGHT * lr_balance * 2.0 +  # 横方向の輪ゴム
-        1.5 * uniformity_score +                       # 8方向均等性
-        0.8 * compactness_score                        # 弾性収束
-    )
-    
-    return rubber_score
+# 古い複雑な輪ゴム計算関数は削除 - app.pyのシンプルなアプローチを採用
     
     def _gpu_distance_calculation(self, transformed_gpu):
         """GPU上で距離計算を実行"""

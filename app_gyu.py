@@ -479,7 +479,7 @@ def main():
         step=-0.05
     )
 
-    # Step2: 近傍ヒルクライム（tx も含めて最適化）
+    # Step2 (Phase1): 近傍ヒルクライム（tx も含めて最適化）
     tx_best, rx_best, ry_best, tz_best, score_best, info_best = hill_climb_4d(
         scorer,
         tx_init=0.0,
@@ -497,7 +497,7 @@ def main():
         tz_max=1.0,
     )
 
-    print("\n最終結果（5本の輪ゴムスプリングモデル）")
+    print("\nPhase1 結果（ノーマル咬合位置）")
     print("-" * 80)
     print(f"  tx = {tx_best:6.3f} mm")
     print(f"  rx = {np.rad2deg(rx_best):6.3f} °")
@@ -517,19 +517,101 @@ def main():
     print(f"  dead springs    = {info_best['spring_zero']}")
     print("-" * 80)
 
-    # 下顎全体に最終変換を適用して保存
-    rot_best = R.from_euler("xyz", [rx_best, ry_best, 0.0]).as_matrix()
-    transformed_all = (rot_best @ lower.vertices.T).T + np.array([tx_best, 0.0, tz_best])
+    # ★ Phase2: tz だけを少し「ギュッ」と噛み込ませる
+    tz_gyu, score_gyu, info_gyu = gyu_refine_tz(
+        scorer,
+        tx_best, rx_best, ry_best, tz_best,
+        extra_depth=0.10,  # ← ギュッとする最大量（mm）。0.05〜0.10 あたりから調整
+        step=-0.01,        # 0.01mm 刻み
+    )
+
+    print("\n最終結果（Phase2: ちょっとギュッ後）")
+    print("-" * 80)
+    print(f"  tx = {tx_best:6.3f} mm")              # tx, rx, ry は Phase1 のまま
+    print(f"  rx = {np.rad2deg(rx_best):6.3f} °")
+    print(f"  ry = {np.rad2deg(ry_best):6.3f} °")
+    print(f"  tz = {tz_gyu:6.3f} mm")              # tz だけ gyu 版
+    print(f"  score           = {score_gyu:.3f}")
+    print(f"  total area      = {info_gyu['total_area']:.4f} mm²")
+    ra2 = info_gyu["region_areas"]
+    print(f"  M_L area        = {ra2['M_L']:.4f} mm²")
+    print(f"  M_R area        = {ra2['M_R']:.4f} mm²")
+    print(f"  PM_L area       = {ra2['PM_L']:.4f} mm²")
+    print(f"  PM_R area       = {ra2['PM_R']:.4f} mm²")
+    print(f"  ANT area        = {ra2['ANT']:.4f} mm²")
+    print(f"  contacts        = {info_gyu['num_contacts']} points")
+    print(f"  spring min      = {info_gyu['spring_min']:.4f}")
+    print(f"  spring var      = {info_gyu['spring_var']:.4f}")
+    print(f"  dead springs    = {info_gyu['spring_zero']}")
+    print("-" * 80)
+
+    # ★ STL に反映するのは Phase2 後の姿勢
+    final_tx = tx_best
+    final_rx = rx_best
+    final_ry = ry_best
+    final_tz = tz_gyu
+
+    rot_final = R.from_euler("xyz", [final_rx, final_ry, 0.0]).as_matrix()
+    transformed_all = (rot_final @ lower.vertices.T).T + np.array([final_tx, 0.0, final_tz])
 
     lower_out = lower.copy()
     lower_out.vertices = transformed_all
 
     out_dir = os.path.dirname(lower_path)
     lower_name = os.path.splitext(os.path.basename(lower_path))[0]
-    out_path = os.path.join(out_dir, f"{lower_name}_spring5_balanced.stl")
+    out_path = os.path.join(out_dir, f"{lower_name}_spring5_balanced_gyu.stl")  # ★ファイル名も分けておく
     lower_out.export(out_path)
     print(f"\n✓ 最終下顎 STL を保存しました: {out_path}")
     print("=" * 80)
+
+def gyu_refine_tz(
+    scorer: SpringOcclusionScorer,
+    tx, rx, ry, tz_start,
+    extra_depth=0.10,      # どこまで深く探索するか（mm）
+    step=-0.01,            # 探索刻み
+    max_score_drop=0.11,   # Phase1 からどこまでスコア低下を許容するか
+):
+    """
+    Phase1 で決めた tx, rx, ry を固定したまま、
+    tz だけを少しマイナス方向（咬み込み方向）に動かして
+    「ちょっとだけギュッとした」位置を探す。
+
+    - Phase1 のスコアから max_score_drop までの悪化は許容
+    - その範囲で「最も深い tz」を採用
+    """
+    # Phase1 の基準スコア
+    base_score, base_info = scorer.evaluate(tx, rx, ry, tz_start)
+
+    best_tz = tz_start
+    best_score = base_score
+    best_info = base_info
+
+    tz = tz_start + step
+    tz_limit = tz_start - extra_depth  # 例: tz_start=-0.15, extra_depth=0.10 → -0.25 まで
+
+    print("\n[Phase2: gyu_refine_tz] tz だけ少し『ギュッ』と探索します")
+    while tz >= tz_limit - 1e-9:
+        score, info = scorer.evaluate(tx, rx, ry, tz)
+        ra = info["region_areas"]
+        print(
+            f"  tz={tz:6.3f} mm -> score={score:7.3f}, "
+            f"area={info['total_area']:.4f}, "
+            f"M_L={ra['M_L']:.3f}, M_R={ra['M_R']:.3f}, "
+            f"PM_L={ra['PM_L']:.3f}, PM_R={ra['PM_R']:.3f}, ANT={ra['ANT']:.3f}"
+        )
+
+        # スコア低下が許容範囲内なら「候補」として受け入れる
+        if score >= base_score - max_score_drop:
+            # より「深い tz」であれば更新
+            if tz < best_tz:
+                best_tz = tz
+                best_score = score
+                best_info = info
+
+        tz += step  # step は負なので、だんだん噛み込み方向へ
+
+    print(f"\n  → gyu 結果: tz={best_tz:.3f} mm, score={best_score:.3f}")
+    return best_tz, best_score, best_info
 
 
 if __name__ == "__main__":
