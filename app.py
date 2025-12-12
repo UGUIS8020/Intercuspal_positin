@@ -6,11 +6,14 @@ from tkinter import Tk, filedialog
 from scipy.spatial.transform import Rotation as R
 
 
+# =============================
+# ユーティリティ
+# =============================
+
 def select_two_stl_files():
     """
-    ファイルダイアログから STL ファイルを2つだけ選択させる。
-    戻り値: (upper_path, lower_path)
-    ※ 1つ目: 上顎, 2つ目: 下顎 のつもりで選んでください
+    ファイルダイアログから STL ファイルを2つ選択
+    1つ目: 上顎, 2つ目: 下顎 として扱う
     """
     root = Tk()
     root.withdraw()
@@ -24,7 +27,6 @@ def select_two_stl_files():
 
     if len(filepaths) != 2:
         print("エラー: STL ファイルは必ず 2 つ選択してください。")
-        print("（1つ目: 上顎, 2つ目: 下顎 の順で選択）")
         sys.exit(1)
 
     upper_path, lower_path = filepaths
@@ -33,10 +35,25 @@ def select_two_stl_files():
     return upper_path, lower_path
 
 
+def load_mesh_safely(filepath):
+    """trimesh で STL を読み込む（簡易チェック付き）"""
+    try:
+        mesh = trimesh.load(filepath)
+        if not mesh.is_watertight:
+            print(f"警告: {os.path.basename(filepath)} は水密ではありません")
+        if len(mesh.vertices) < 100:
+            raise ValueError(f"頂点数が少なすぎます: {len(mesh.vertices)}")
+        print(f"✓ {os.path.basename(filepath)} 読み込み成功 ({len(mesh.vertices)} 頂点)")
+        return mesh
+    except Exception as e:
+        print(f"エラー: {filepath} の読み込みに失敗しました")
+        print("詳細:", e)
+        sys.exit(1)
+
+
 def per_vertex_area(mesh: trimesh.Trimesh):
     """
-    各三角形の面積を3頂点に等分配して、
-    頂点ごとの代表面積にする簡易計算。
+    各三角形の面積を3頂点に等分配して頂点面積とする
     """
     areas = np.zeros(len(mesh.vertices))
     for face, area in zip(mesh.faces, mesh.area_faces):
@@ -45,298 +62,474 @@ def per_vertex_area(mesh: trimesh.Trimesh):
     return areas
 
 
-def evaluate_contact_score(
-    tx, ty, rx, ry, tz,
-    sample_vertices, sample_areas, upper,
-    x_mid, y_mid
-):
+# =============================
+# スコアリング（5本の輪ゴムスプリングモデル）
+# =============================
+
+class SpringOcclusionScorer:
     """
-    姿勢 (tx, ty, rx, ry, tz) に対する
-    「接触面積 + バランスボーナス - ペナルティ」のスコアを返す。
+    上下歯列を「輪ゴム5本」で引っ張り合うイメージで評価するスコア計算クラス
 
-    tx, ty, tz: 並進（mm相当）
-    rx, ry:     回転（radian）
-    x_mid, y_mid: 左右・前後の境界
+    5本のバネ:
+      - M_L : 左大臼歯ブロック
+      - M_R : 右大臼歯ブロック
+      - PM_L: 左小臼歯ブロック
+      - PM_R: 右小臼歯ブロック
+      - ANT : 前歯ブロック（左右まとめて）
     """
-    # 回転行列（Z軸回りはここでは 0）
-    rot = R.from_euler("xyz", [rx, ry, 0.0]).as_matrix()
 
-    # サンプル頂点を回転＋平行移動
-    transformed = (rot @ sample_vertices.T).T + np.array([tx, ty, tz])
+    def __init__(
+        self,
+        upper_mesh: trimesh.Trimesh,
+        lower_sample_vertices: np.ndarray,
+        lower_sample_areas: np.ndarray,
+        contact_threshold: float = 0.03,
+        rot_penalty: float = 1.5,
+        trans_penalty: float = 2.0,
+    ):
+        self.upper = upper_mesh
+        self.v0 = lower_sample_vertices  # 下顎サンプル頂点（基準座標）
+        self.areas = lower_sample_areas
+        self.contact_threshold = contact_threshold
+        self.rot_penalty = rot_penalty
+        self.trans_penalty = trans_penalty
 
-    # 最近接距離（上顎→サンプル下顎）
-    closest_points, distances, triangle_id = upper.nearest.on_surface(transformed)
+        # ----------------------------
+        # 5ブロックへの自動分割
+        # ----------------------------
+        x = self.v0[:, 0]
+        y = self.v0[:, 1]
 
-    # 接触判定の閾値
-    tol_contact = 0.02   # 0.02 mm 以内 → 接触
-    tol_tight   = 0.005  # 0.005 mm 以内 → きつい接触（ペナルティ）
+        self.x_mid = float(np.median(x))
+        y_min, y_max = float(y.min()), float(y.max())
+        if y_max == y_min:
+            # 万一全て同じ値なら、全部「臼歯」として扱う
+            y_cut1 = y_min - 0.1
+            y_cut2 = y_min + 0.1
+        else:
+            dy = y_max - y_min
+            y_cut1 = y_min + dy / 3.0        # 大臼歯 / 小臼歯の境
+            y_cut2 = y_min + dy * 2.0 / 3.0  # 小臼歯 / 前歯の境
 
-    contact_mask = distances <= tol_contact
-    contact_idx = np.where(contact_mask)[0]
+        is_left = x <= self.x_mid
+        is_right = ~is_left
 
-    contact_area = 0.0
-    anterior_area = 0.0
-    posterior_area = 0.0
-    left_area = 0.0
-    right_area = 0.0
+        band_molar = y <= y_cut1
+        band_premolar = (y > y_cut1) & (y <= y_cut2)
+        band_ant = y > y_cut2
 
-    if contact_idx.size > 0:
-        c_areas = sample_areas[contact_idx]
-        c_pts = sample_vertices[contact_idx]
+        mask_M_L = is_left & band_molar
+        mask_M_R = is_right & band_molar
+        mask_PM_L = is_left & band_premolar
+        mask_PM_R = is_right & band_premolar
+        mask_ANT = band_ant  # 前歯は左右まとめて一本のゴム
 
-        x = c_pts[:, 0]
-        y = c_pts[:, 1]
+        self.region_masks = {
+            "M_L": mask_M_L,
+            "M_R": mask_M_R,
+            "PM_L": mask_PM_L,
+            "PM_R": mask_PM_R,
+            "ANT": mask_ANT,
+        }
 
-        contact_area = float(c_areas.sum())
+        # 実際に頂点が存在するブロックだけを「有効バネ」とみなす
+        self.valid_regions = [
+            name for name, m in self.region_masks.items() if np.any(m)
+        ]
 
-        # 前後
-        anterior_mask = y >= y_mid
-        posterior_mask = y < y_mid
-        anterior_area = float(c_areas[anterior_mask].sum())
-        posterior_area = float(c_areas[posterior_mask].sum())
+        print("\n[ブロック分割（輪ゴム5本）]")
+        for name in ["M_L", "M_R", "PM_L", "PM_R", "ANT"]:
+            cnt = int(self.region_masks[name].sum())
+            flag = "✓" if name in self.valid_regions else "（頂点なし）"
+            print(f"  {name:5s}: {cnt:4d} 点 {flag}")
+        print(f"  有効バネ本数: {len(self.valid_regions)}")
 
-        # 左右
-        left_mask = x <= x_mid
-        right_mask = x > x_mid
-        left_area = float(c_areas[left_mask].sum())
-        right_area = float(c_areas[right_mask].sum())
+    # ----------------------------
+    # 姿勢評価
+    # ----------------------------
 
-    # きつすぎる接触（めり込み）ペナルティ
-    tight_mask = distances <= tol_tight
-    tight_area = float(sample_areas[tight_mask].sum())
-    penetration_penalty = tight_area
+    def evaluate(self, tx, rx_rad, ry_rad, tz, max_dist_clip=0.1):
+        """
+        姿勢 (tx, rx, ry, tz) に対するスコアを返す
+        - tx: 左右方向スライド（mm）
+        - rx, ry: ラジアン（X, Y軸まわりの回転）
+        - tz: 垂直方向（mm）
+        ty は 0 固定（前後スライドはここでは見ない）
 
-    # 前後・左右バランスのボーナス
-    ant_post_balance = min(anterior_area, posterior_area)
-    left_right_balance = min(left_area, right_area)
+        戻り値:
+          score, info_dict
+        """
+        ty = 0.0
 
-    # 動きすぎペナルティ
-    rot_penalty = abs(rx) + abs(ry)
-    trans_penalty = np.linalg.norm([tx, ty, tz])
+        # 剛体変換（下顎サンプル頂点）
+        rot = R.from_euler("xyz", [rx_rad, ry_rad, 0.0]).as_matrix()
+        transformed = (rot @ self.v0.T).T + np.array([tx, ty, tz])
 
-    # 重みはあとで調整できるパラメータ
-    SCORE_BALANCE_AP = 0.4   # 前後バランス
-    SCORE_BALANCE_LR = 0.2   # 左右バランス
+        # 上顎メッシュとの最近接距離
+        closest_points, distances, tri_id = self.upper.nearest.on_surface(transformed)
 
-    score = (
-        contact_area
-        + SCORE_BALANCE_AP * ant_post_balance
-        + SCORE_BALANCE_LR * left_right_balance
-        - 0.5 * penetration_penalty
-        - 2.0 * rot_penalty
-        - 3.0 * trans_penalty
-    )
+        # 「輪ゴムが届いている」範囲：contact_threshold 以内
+        d = np.clip(distances, 0.0, max_dist_clip)
+        contact_mask = d <= self.contact_threshold
 
-    return score, contact_area
+        # --------------------------------------------------
+        # 1) まったく噛んでいない場合
+        #    → 回転・移動ペナルティ + 大きなマイナス定数
+        #       （どんな「噛んでいる姿勢」より必ず不利にする）
+        # --------------------------------------------------
+        if not np.any(contact_mask):
+            rot_pen = self.rot_penalty * (abs(rx_rad) + abs(ry_rad))
+            trans_pen = self.trans_penalty * np.sqrt(tx * tx + tz * tz)
 
+            # 「接触ゼロは最低でも -10 点」くらいにしておく
+            score = -(rot_pen + trans_pen) - 10.0
 
-def close_until_first_contact(
-    sample_vertices, sample_areas, upper, x_mid, y_mid,
-    rx0=0.0, ry0=0.0, tz0=0.0,
-    step=-0.05, max_steps=40
-):
-    """
-    バイト位置 (rx0, ry0, tz0) から tz 方向に少しずつ閉口していき、
-    接触面積が 0 → >0 になる最初の位置を探す。
-    tx, ty はここでは 0 のまま固定。
-    """
-    tx = 0.0
-    ty = 0.0
-    rx, ry, tz = rx0, ry0, tz0
+            zero_dict = {name: 0.0 for name in self.region_masks.keys()}
+            info = {
+                "total_area": 0.0,
+                "num_contacts": 0,
+                "region_areas": zero_dict,
+                "region_scores": zero_dict,
+                "left_area": 0.0,
+                "right_area": 0.0,
+                "anterior_area": 0.0,
+                "posterior_area": 0.0,
+                "spring_min": 0.0,
+                "spring_var": 0.0,
+                "spring_mean": 0.0,
+                "spring_zero": len(self.valid_regions),
+                "tx": tx,
+                "rx": rx_rad,
+                "ry": ry_rad,
+                "tz": tz,
+            }
+            return score, info
 
-    last_score, last_area = evaluate_contact_score(
-        tx, ty, rx, ry, tz,
-        sample_vertices, sample_areas, upper,
-        x_mid, y_mid
-    )
+        # --------------------------------------------------
+        # 2) ここから下は「接触あり」のケース
+        # --------------------------------------------------
 
-    for i in range(max_steps):
-        tz_new = tz + step
-        score, area = evaluate_contact_score(
-            tx, ty, rx, ry, tz_new,
-            sample_vertices, sample_areas, upper,
-            x_mid, y_mid
+        # contact_mask 部だけの距離・面積
+        th = self.contact_threshold
+        d_c = d[contact_mask]
+        w = 1.0 - (d_c / th) ** 2               # d=0 で1, d=th で0
+        w = np.clip(w, 0.0, 1.0)
+
+        # 「バネの縮み量 × 断面積」のようなイメージ
+        local_strength_c = self.areas[contact_mask] * w
+
+        # 全頂点長の配列に戻す（コンタクト頂点以外は0）
+        strength_full = np.zeros_like(self.areas)
+        area_full = np.zeros_like(self.areas)
+        strength_full[contact_mask] = local_strength_c
+        area_full[contact_mask] = self.areas[contact_mask]
+
+        # ----- バネごとのスコア・面積 -----
+        region_scores = {}
+        region_areas = {}
+        scores_list = []
+
+        for name in self.valid_regions:
+            mask = self.region_masks[name]
+            s = float(strength_full[mask].sum())
+            a = float(area_full[mask].sum())
+            region_scores[name] = s
+            region_areas[name] = a
+            scores_list.append(s)
+
+        # 頂点が存在しないブロックは 0 扱い（ただしスコア集計には載せない）
+        for name in self.region_masks.keys():
+            if name not in region_scores:
+                region_scores[name] = 0.0
+                region_areas[name] = 0.0
+
+        scores_arr = np.array(scores_list, dtype=float)
+        total_strength = float(scores_arr.sum())
+        total_area = float(area_full.sum())
+
+        # 5本の輪ゴムの状態
+        if len(scores_arr) > 0:
+            min_region = float(scores_arr.min())
+            var_region = float(scores_arr.var())
+            mean_region = float(scores_arr.mean())
+            zero_regions = int(np.sum(scores_arr < 1e-6))
+        else:
+            min_region = 0.0
+            var_region = 0.0
+            mean_region = 0.0
+            zero_regions = 0
+
+        # 左右・前後の合計（ざっくり把握用）
+        left_area = region_areas["M_L"] + region_areas["PM_L"]
+        right_area = region_areas["M_R"] + region_areas["PM_R"]
+        anterior_area = region_areas["ANT"]
+        posterior_area = left_area + right_area
+
+        # 回転・移動ペナルティ
+        rot_pen = self.rot_penalty * (abs(rx_rad) + abs(ry_rad))
+        trans_pen = self.trans_penalty * np.sqrt(tx * tx + tz * tz)
+
+        # ----------------------------
+        # 最終スコア
+        #   - 全体の噛み込み量（total_strength）
+        #   - 最も弱いバネ（min_region）を強く評価
+        #   - バネ間のばらつき（var_region）と「死んでいるバネ」の本数を減点
+        # ----------------------------
+        score = (
+            0.4 * total_strength   # 全体として噛んでいるか
+            + 1.4 * min_region     # 一番弱いバネもちゃんと張っているか
+            - 0.3 * var_region     # 強いバネと弱いバネの差が大きいほど減点
+            - 0.8 * zero_regions   # 完全にサボっているブロックがあると減点
+            - rot_pen
+            - trans_pen
         )
-        print(f"[close step {i+1}] tz={tz_new:.3f}, area={area:.4f}")
 
-        tz = tz_new
-        last_score, last_area = score, area
-        if area > 0.0:
-            print("最初の接触が得られました。")
-            return tx, ty, rx, ry, tz, score, area
+        info = {
+            "total_area": total_area,
+            "num_contacts": int(contact_mask.sum()),
+            "region_areas": region_areas,
+            "region_scores": region_scores,
+            "left_area": left_area,
+            "right_area": right_area,
+            "anterior_area": anterior_area,
+            "posterior_area": posterior_area,
+            "spring_min": min_region,
+            "spring_var": var_region,
+            "spring_mean": mean_region,
+            "spring_zero": zero_regions,
+            "tx": tx,
+            "rx": rx_rad,
+            "ry": ry_rad,
+            "tz": tz,
+        }
+        return score, info
 
-    print("close_until_first_contact: 接触が見つからないまま終了しました。")
-    return tx, ty, rx, ry, tz, last_score, last_area
 
+# =============================
+# 探索アルゴリズム
+# =============================
 
-def hill_climb_guided(
-    tx_init, ty_init, rx_init, ry_init, tz_init,
-    sample_vertices, sample_areas, upper, x_mid, y_mid,
-    deg_step=0.5, t_step=0.05,
-    max_iter=20
-):
+def line_search_tz(scorer: SpringOcclusionScorer,
+                   tx0=0.0, rx0=0.0, ry0=0.0,
+                   tz_start=0.5, tz_end=-1.5, step=-0.05):
     """
-    誘導面に従うイメージで、近傍姿勢の中から
-    「スコアが一番良い方向」に少しずつ移動していくヒルクライム。
-    5自由度: tx, ty, rx, ry, tz
+    tz 方向にまっすぐ閉口しながら、スコア最大となる tz を探す
+    → これをヒルクライムの初期値にする
+    """
+    best_score = -1e9
+    best_tz = 0.0
+    best_info = None
+
+    tz = tz_start
+    print("\n[Step1] tz 方向スキャンで初期位置を探索")
+    i = 0
+    while tz >= tz_end - 1e-9:
+        score, info = scorer.evaluate(tx0, rx0, ry0, tz)
+        if i % 5 == 0:
+            ra = info["region_areas"]
+            print(
+                f"  tz={tz:6.3f} mm -> score={score:7.3f}, "
+                f"area={info['total_area']:.4f}, "
+                f"M_L={ra['M_L']:.3f}, M_R={ra['M_R']:.3f}, "
+                f"PM_L={ra['PM_L']:.3f}, PM_R={ra['PM_R']:.3f}, ANT={ra['ANT']:.3f}"
+            )
+        if score > best_score:
+            best_score = score
+            best_tz = tz
+            best_info = info
+        tz += step
+        i += 1
+
+    print(
+        f"\n  → 初期候補: tz={best_tz:.3f} mm, score={best_score:.3f}, "
+        f"area={best_info['total_area']:.4f}"
+    )
+    return best_tz, best_score, best_info
+
+
+def hill_climb_4d(scorer: SpringOcclusionScorer,
+                  tx_init, rx_init, ry_init, tz_init,
+                  tx_step=0.05, deg_step=0.5, tz_step=0.05,
+                  max_iter=20,
+                  tx_min=-0.8, tx_max=0.8,
+                  max_rot_deg=5.0,
+                  tz_min=-2.0, tz_max=1.0):
+    """
+    (tx, rx, ry, tz) の4自由度ヒルクライム
+    左右スライド + 前後・左右回転 + 上下
     """
     tx = tx_init
-    ty = ty_init
     rx = rx_init
     ry = ry_init
     tz = tz_init
 
-    score, area = evaluate_contact_score(
-        tx, ty, rx, ry, tz,
-        sample_vertices, sample_areas, upper,
-        x_mid, y_mid
-    )
+    score, info = scorer.evaluate(tx, rx, ry, tz)
+    print("\n[Step2] 近傍ヒルクライム開始")
     print(
-        f"[hill start] tx={tx:.3f}, ty={ty:.3f}, "
-        f"rx={np.rad2deg(rx):.3f}°, ry={np.rad2deg(ry):.3f}°, "
-        f"tz={tz:.3f}, area={area:.4f}"
+        f"  start: tx={tx:.3f}mm, rx={np.rad2deg(rx):.3f}°, "
+        f"ry={np.rad2deg(ry):.3f}°, tz={tz:.3f} mm, "
+        f"score={score:.3f}, area={info['total_area']:.4f}"
     )
 
     rad_step = np.deg2rad(deg_step)
+    max_rot_rad = np.deg2rad(max_rot_deg)
 
     for it in range(max_iter):
+        improved = False
         best_local_score = score
-        best_local_params = (tx, ty, rx, ry, tz)
+        best_local_params = (tx, rx, ry, tz)
+        best_local_info = info
 
-        # 近傍：各自由度を [-step, 0, +step] でゆらす
-        for d_tx in [-t_step, 0.0, t_step]:
-            for d_ty in [-t_step, 0.0, t_step]:
-                for d_rx in [-rad_step, 0.0, rad_step]:
-                    for d_ry in [-rad_step, 0.0, rad_step]:
-                        for d_tz in [-t_step, 0.0, t_step]:
+        for d_tx in [-tx_step, 0.0, tx_step]:
+            for d_rx in [-rad_step, 0.0, rad_step]:
+                for d_ry in [-rad_step, 0.0, rad_step]:
+                    for d_tz in [-tz_step, 0.0, tz_step]:
+                        if d_tx == 0.0 and d_rx == 0.0 and d_ry == 0.0 and d_tz == 0.0:
+                            continue
 
-                            if (
-                                d_tx == 0.0 and d_ty == 0.0 and
-                                d_rx == 0.0 and d_ry == 0.0 and d_tz == 0.0
-                            ):
-                                continue
+                        tx_c = tx + d_tx
+                        rx_c = rx + d_rx
+                        ry_c = ry + d_ry
+                        tz_c = tz + d_tz
 
-                            tx_c = tx + d_tx
-                            ty_c = ty + d_ty
-                            rx_c = rx + d_rx
-                            ry_c = ry + d_ry
-                            tz_c = tz + d_tz
+                        # 範囲制限
+                        if tx_c < tx_min or tx_c > tx_max:
+                            continue
+                        if abs(rx_c) > max_rot_rad or abs(ry_c) > max_rot_rad:
+                            continue
+                        if tz_c < tz_min or tz_c > tz_max:
+                            continue
 
-                            # 動きの範囲制限
-                            if abs(rx_c) > np.deg2rad(5.0):
-                                continue
-                            if abs(ry_c) > np.deg2rad(5.0):
-                                continue
-                            if abs(tx_c) > 0.6 or abs(ty_c) > 0.6:
-                                continue
-                            if tz_c < -1.5 or tz_c > 1.0:
-                                continue
+                        s_c, info_c = scorer.evaluate(tx_c, rx_c, ry_c, tz_c)
+                        if s_c > best_local_score:
+                            best_local_score = s_c
+                            best_local_params = (tx_c, rx_c, ry_c, tz_c)
+                            best_local_info = info_c
+                            improved = True
 
-                            s, a = evaluate_contact_score(
-                                tx_c, ty_c, rx_c, ry_c, tz_c,
-                                sample_vertices, sample_areas, upper,
-                                x_mid, y_mid
-                            )
-
-                            if s > best_local_score:
-                                best_local_score = s
-                                best_local_params = (tx_c, ty_c, rx_c, ry_c, tz_c)
-
-        # 改善がなければ終了（局所最大）
-        if best_local_score <= score:
-            print(f"[hill stop] it={it}, 改善なし → 終了")
+        if not improved:
+            print(f"  it={it}: 改善なし → 終了")
             break
 
-        tx, ty, rx, ry, tz = best_local_params
+        tx, rx, ry, tz = best_local_params
         score = best_local_score
-        _, area = evaluate_contact_score(
-            tx, ty, rx, ry, tz,
-            sample_vertices, sample_areas, upper,
-            x_mid, y_mid
-        )
-
+        info = best_local_info
+        ra = info["region_areas"]
         print(
-            f"[hill {it+1}] tx={tx:.3f}, ty={ty:.3f}, "
-            f"rx={np.rad2deg(rx):.3f}°, ry={np.rad2deg(ry):.3f}°, "
-            f"tz={tz:.3f}, score={score:.4f}, area={area:.4f}"
+            f"  it={it+1}: tx={tx:6.3f}mm, rx={np.rad2deg(rx):5.2f}°, "
+            f"ry={np.rad2deg(ry):5.2f}°, tz={tz:6.3f} mm, "
+            f"score={score:7.3f}, area={info['total_area']:.4f}, "
+            f"M_L={ra['M_L']:.3f}, M_R={ra['M_R']:.3f}, "
+            f"PM_L={ra['PM_L']:.3f}, PM_R={ra['PM_R']:.3f}, ANT={ra['ANT']:.3f}"
         )
 
-    return tx, ty, rx, ry, tz, score, area
+    return tx, rx, ry, tz, score, info
 
+
+# =============================
+# メイン
+# =============================
 
 def main():
-    # 1. STL を 2つ選択（上顎・下顎）
+    print("=" * 80)
+    print("咬頭嵌合位自動最適化（5本の輪ゴムスプリングモデル）")
+    print("=" * 80)
+
     upper_path, lower_path = select_two_stl_files()
+    upper = load_mesh_safely(upper_path)
+    lower = load_mesh_safely(lower_path)
 
-    # 2. メッシュ読み込み
-    upper = trimesh.load(upper_path)  # 上顎：固定
-    lower = trimesh.load(lower_path)  # 下顎：バイト位置
-
-    # 3. 頂点ごとの代表面積（下顎・全頂点）
+    # 下顎頂点のエリア & サンプリング
+    print("\n頂点面積を計算中...")
     lower_vertex_area_all = per_vertex_area(lower)
 
-    # 3.1 計算用に頂点をサンプリング
     all_vertices = lower.vertices
     n_vertices = len(all_vertices)
-    print(f"下顎の頂点数: {n_vertices}")
+    SAMPLE_SIZE = 1200  # 計算時間と精度のバランス
 
-    SAMPLE_SIZE = 2000
     if n_vertices > SAMPLE_SIZE:
         rng = np.random.default_rng(0)
         sample_idx = rng.choice(n_vertices, size=SAMPLE_SIZE, replace=False)
+        print(f"✓ {n_vertices} 頂点から {SAMPLE_SIZE} 頂点をサンプリング")
     else:
         sample_idx = np.arange(n_vertices)
+        print(f"✓ 全 {n_vertices} 頂点を使用（{n_vertices} 頂点）")
 
     sample_vertices = all_vertices[sample_idx]
     sample_areas = lower_vertex_area_all[sample_idx]
 
-    print(f"サンプリングする頂点数: {len(sample_vertices)}")
-
-    # 前後・左右の境界（中央値でざっくり分ける）
-    sample_x = sample_vertices[:, 0]
-    sample_y = sample_vertices[:, 1]
-    x_mid = float(np.median(sample_x))
-    y_mid = float(np.median(sample_y))
-    print(f"x_mid (左右の境界) = {x_mid:.4f}")
-    print(f"y_mid (前後の境界) = {y_mid:.4f}")
-
-    # 4. ステージ1：軽く沈めて最初の接触を作る（tx, ty は 0 のまま）
-    tx0, ty0, rx0, ry0, tz0, score0, area0 = close_until_first_contact(
-        sample_vertices, sample_areas, upper, x_mid, y_mid,
-        rx0=0.0, ry0=0.0, tz0=0.0,
-        step=-0.05, max_steps=40
+    # スコアラー準備
+    scorer = SpringOcclusionScorer(
+        upper_mesh=upper,
+        lower_sample_vertices=sample_vertices,
+        lower_sample_areas=sample_areas,
+        contact_threshold=0.03,  # 0〜0.03mm を「輪ゴムが届いている範囲」とみなす
+        rot_penalty=1.5,
+        trans_penalty=2.0,
     )
 
-    # 5. ステージ2：誘導に沿ってヒルクライム
-    tx_best, ty_best, rx_best, ry_best, tz_best, score_best, area_best = hill_climb_guided(
-        tx0, ty0, rx0, ry0, tz0,
-        sample_vertices, sample_areas, upper, x_mid, y_mid,
-        deg_step=0.5,   # 回転ステップ
-        t_step=0.05,    # 並進ステップ
-        max_iter=20
+    # Step1: tz 方向スキャンで初期位置
+    best_tz, best_score_tz, info_tz = line_search_tz(
+        scorer,
+        tx0=0.0,
+        rx0=0.0,
+        ry0=0.0,
+        tz_start=0.5,
+        tz_end=-1.5,
+        step=-0.05
     )
 
-    print("最終結果:")
-    print("  tx, ty [mm]  =", tx_best, ty_best)
-    print("  rx, ry [deg] =", np.rad2deg(rx_best), np.rad2deg(ry_best))
-    print("  tz [mm]      =", tz_best)
-    print("  score        =", score_best)
-    print("  contact area =", area_best)
+    # Step2: 近傍ヒルクライム（tx も含めて最適化）
+    tx_best, rx_best, ry_best, tz_best, score_best, info_best = hill_climb_4d(
+        scorer,
+        tx_init=0.0,
+        rx_init=0.0,
+        ry_init=0.0,
+        tz_init=best_tz,
+        tx_step=0.05,
+        deg_step=0.5,
+        tz_step=0.05,
+        max_iter=20,
+        tx_min=-0.8,
+        tx_max=0.8,
+        max_rot_deg=5.0,
+        tz_min=-2.0,
+        tz_max=1.0,
+    )
 
-    # 6. ベストな回転＋平行移動を下顎全体に適用
+    print("\n最終結果（5本の輪ゴムスプリングモデル）")
+    print("-" * 80)
+    print(f"  tx = {tx_best:6.3f} mm")
+    print(f"  rx = {np.rad2deg(rx_best):6.3f} °")
+    print(f"  ry = {np.rad2deg(ry_best):6.3f} °")
+    print(f"  tz = {tz_best:6.3f} mm")
+    print(f"  score           = {score_best:.3f}")
+    print(f"  total area      = {info_best['total_area']:.4f} mm²")
+    ra = info_best["region_areas"]
+    print(f"  M_L area        = {ra['M_L']:.4f} mm²")
+    print(f"  M_R area        = {ra['M_R']:.4f} mm²")
+    print(f"  PM_L area       = {ra['PM_L']:.4f} mm²")
+    print(f"  PM_R area       = {ra['PM_R']:.4f} mm²")
+    print(f"  ANT area        = {ra['ANT']:.4f} mm²")
+    print(f"  contacts        = {info_best['num_contacts']} points")
+    print(f"  spring min      = {info_best['spring_min']:.4f}")
+    print(f"  spring var      = {info_best['spring_var']:.4f}")
+    print(f"  dead springs    = {info_best['spring_zero']}")
+    print("-" * 80)
+
+    # 下顎全体に最終変換を適用して保存
     rot_best = R.from_euler("xyz", [rx_best, ry_best, 0.0]).as_matrix()
-    best_vertices = (rot_best @ lower.vertices.T).T + np.array([tx_best, ty_best, tz_best])
+    transformed_all = (rot_best @ lower.vertices.T).T + np.array([tx_best, 0.0, tz_best])
 
-    lower_refined = lower.copy()
-    lower_refined.vertices = best_vertices
+    lower_out = lower.copy()
+    lower_out.vertices = transformed_all
 
-    # 保存先は下顎ファイルと同じフォルダ
-    lower_dir = os.path.dirname(lower_path)
+    out_dir = os.path.dirname(lower_path)
     lower_name = os.path.splitext(os.path.basename(lower_path))[0]
-    out_path = os.path.join(lower_dir, f"{lower_name}_refined_mip_guided.stl")
-
-    lower_refined.export(out_path)
-    print("誘導に沿って調整した下顎 STL を保存しました:", out_path)
+    out_path = os.path.join(out_dir, f"{lower_name}_spring5_balanced.stl")
+    lower_out.export(out_path)
+    print(f"\n✓ 最終下顎 STL を保存しました: {out_path}")
+    print("=" * 80)
 
 
 if __name__ == "__main__":
