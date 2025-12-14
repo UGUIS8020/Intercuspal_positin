@@ -4,6 +4,7 @@ import numpy as np
 import trimesh
 from tkinter import Tk, filedialog
 from scipy.spatial.transform import Rotation as R
+import trimesh.proximity
 
 
 # =============================
@@ -36,9 +37,14 @@ def select_two_stl_files():
 
 
 def load_mesh_safely(filepath):
-    """trimesh で STL を読み込む（簡易チェック付き）"""
     try:
-        mesh = trimesh.load(filepath)
+        mesh = trimesh.load_mesh(filepath, process=False)  # ←重要
+        if isinstance(mesh, trimesh.Scene):
+            # Scene なら結合して Trimesh 化
+            mesh = trimesh.util.concatenate(tuple(mesh.dump()))
+        if not isinstance(mesh, trimesh.Trimesh):
+            raise ValueError("Trimesh として読み込めませんでした")
+
         if not mesh.is_watertight:
             print(f"警告: {os.path.basename(filepath)} は水密ではありません")
         if len(mesh.vertices) < 100:
@@ -93,6 +99,7 @@ class SpringOcclusionScorer:
         self.contact_threshold = contact_threshold
         self.rot_penalty = rot_penalty
         self.trans_penalty = trans_penalty
+        self.pq = trimesh.proximity.ProximityQuery(self.upper)
 
         # ----------------------------
         # 5ブロックへの自動分割
@@ -165,8 +172,8 @@ class SpringOcclusionScorer:
         rot = R.from_euler("xyz", [rx_rad, ry_rad, 0.0]).as_matrix()
         transformed = (rot @ self.v0.T).T + np.array([tx, ty, tz])
 
-        # 上顎メッシュとの最近接距離
-        closest_points, distances, tri_id = self.upper.nearest.on_surface(transformed)
+        # 上顎メッシュとの最近接距離        
+        closest_points, distances, tri_id = self.pq.on_surface(transformed)
 
         # 「輪ゴムが届いている」範囲：contact_threshold 以内
         d = np.clip(distances, 0.0, max_dist_clip)
@@ -279,7 +286,7 @@ class SpringOcclusionScorer:
             0.4 * total_strength   # 全体として噛んでいるか
             + 1.4 * min_region     # 一番弱いバネもちゃんと張っているか
             - 0.3 * var_region     # 強いバネと弱いバネの差が大きいほど減点
-            - 0.8 * zero_regions   # 完全にサボっているブロックがあると減点
+            - 1.0 * zero_regions   # 完全にサボっているブロックがあると減点
             - rot_pen
             - trans_pen
         )
@@ -350,7 +357,7 @@ def line_search_tz(scorer: SpringOcclusionScorer,
 def hill_climb_4d(scorer: SpringOcclusionScorer,
                   tx_init, rx_init, ry_init, tz_init,
                   tx_step=0.05, deg_step=0.5, tz_step=0.05,
-                  max_iter=20,
+                  max_iter=10,
                   tx_min=-0.8, tx_max=0.8,
                   max_rot_deg=5.0,
                   tz_min=-2.0, tz_max=1.0):
@@ -489,7 +496,7 @@ def main():
         tx_step=0.05,
         deg_step=0.5,
         tz_step=0.05,
-        max_iter=20,
+        max_iter=10,
         tx_min=-0.8,
         tx_max=0.8,
         max_rot_deg=5.0,
