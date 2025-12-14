@@ -12,28 +12,40 @@ from scipy.spatial.transform import Rotation as R
 
 def select_two_stl_files():
     """
-    ファイルダイアログから STL ファイルを2つ選択
-    1つ目: 上顎, 2つ目: 下顎 として扱う
+    ファイルダイアログから STL ファイルを2回に分けて選択
+    1回目: 上顎, 2回目: 下顎
     """
     root = Tk()
     root.withdraw()
 
-    filepaths = filedialog.askopenfilenames(
-        title="上顎と下顎の STL ファイルをこの順に2つ選択してください（1つ目: 上顎, 2つ目: 下顎）",
+    upper_path = filedialog.askopenfilename(
+        title="【1/2】上顎の STL ファイルを選択してください",
         filetypes=[("STL files", "*.stl"), ("All files", "*.*")]
     )
+    if not upper_path:
+        print("エラー: 上顎 STL が選択されませんでした。")
+        root.destroy()
+        sys.exit(1)
+
+    lower_path = filedialog.askopenfilename(
+        title="【2/2】下顎の STL ファイルを選択してください",
+        filetypes=[("STL files", "*.stl"), ("All files", "*.*")]
+    )
+    if not lower_path:
+        print("エラー: 下顎 STL が選択されませんでした。")
+        root.destroy()
+        sys.exit(1)
+
     root.update()
     root.destroy()
 
-    if len(filepaths) != 2:
-        print("エラー: STL ファイルは必ず 2 つ選択してください。")
+    if os.path.abspath(upper_path) == os.path.abspath(lower_path):
+        print("エラー: 同じ STL が2回選択されています。上顎と下顎は別ファイルを選んでください。")
         sys.exit(1)
 
-    upper_path, lower_path = filepaths
     print("上顎 STL:", upper_path)
     print("下顎 STL:", lower_path)
     return upper_path, lower_path
-
 
 def load_mesh_safely(filepath):
     """trimesh で STL を読み込む（簡易チェック付き）"""
@@ -143,6 +155,19 @@ class SpringOcclusionScorer:
             flag = "✓" if name in self.valid_regions else "（頂点なし）"
             print(f"  {name:5s}: {cnt:4d} 点 {flag}")
         print(f"  有効バネ本数: {len(self.valid_regions)}")
+
+        eps = 1e-12
+        self.region_cap = {}
+        for name, mask in self.region_masks.items():
+            cap = float(self.areas[mask].sum()) if np.any(mask) else 0.0
+            self.region_cap[name] = cap
+
+        capL = self.region_cap["M_L"] + self.region_cap["PM_L"]
+        capR = self.region_cap["M_R"] + self.region_cap["PM_R"]
+        self.target_L_ratio = capL / (capL + capR + eps)
+
+        # 左側の中で PM_L が占める“自然な比率”（欠損でM_Lが少ないとここが上がる）
+        self.target_PM_L_share = self.region_cap["PM_L"] / (capL + eps)
 
     # ----------------------------
     # 姿勢評価
@@ -277,7 +302,7 @@ class SpringOcclusionScorer:
         # ----------------------------
         score = (
             0.4 * total_strength   # 全体として噛んでいるか
-            + 1.4 * min_region     # 一番弱いバネもちゃんと張っているか
+            + 1.8 * min_region     # 一番弱いバネもちゃんと張っているか
             - 0.3 * var_region     # 強いバネと弱いバネの差が大きいほど減点
             - 0.8 * zero_regions   # 完全にサボっているブロックがあると減点
             - rot_pen
@@ -311,37 +336,78 @@ class SpringOcclusionScorer:
 
 def line_search_tz(scorer: SpringOcclusionScorer,
                    tx0=0.0, rx0=0.0, ry0=0.0,
-                   tz_start=0.5, tz_end=-1.5, step=-0.05):
+                   tz_start=0.5, tz_end=-1.5, step=-0.05,
+                   # ★バランス補正の重み（まずはこのくらいから）
+                   w_lr=1.2,          # 左右バランス（L_ratio vs target_L_ratio）
+                   w_pml=0.8,         # 左小臼歯（PM_L）の偏り抑制
+                   pml_margin=0.10,   # “許容する”PM_L share の余裕
+                   w_mr=0.4           # 右大臼歯（M_R）を少し押す
+                   ):
     """
-    tz 方向にまっすぐ閉口しながら、スコア最大となる tz を探す
+    tz 方向にまっすぐ閉口しながら、
+    score最大ではなく「score + バランス補正」を最大化する tz を探す
     → これをヒルクライムの初期値にする
     """
-    best_score = -1e9
-    best_tz = 0.0
+
+    def objective(tx, rx, ry, tz):
+        score, info = scorer.evaluate(tx, rx, ry, tz)
+        rs = info["region_scores"]
+
+        L = rs["M_L"] + rs["PM_L"]
+        R = rs["M_R"] + rs["PM_R"]
+        denom = L + R + 1e-12
+        L_ratio = L / denom
+
+        # 左側の中でPM_Lが占める比率（左大臼歯欠損などで上がりやすい）
+        pm_l_share = rs["PM_L"] / (L + 1e-12)
+
+        # 目標からのズレ（欠損を cap で見て target_L_ratio が決まる想定）
+        pen_lr = abs(L_ratio - scorer.target_L_ratio)
+
+        # PM_L偏りが「自然比 + margin」を超えた分だけ抑える
+        excess = max(0.0, pm_l_share - (scorer.target_PM_L_share + pml_margin))
+        pen_pml = excess
+
+        # 右大臼歯を少し押す（“見た目で右が弱い”対策）
+        mr = rs["M_R"]
+
+        obj = score - w_lr * pen_lr - w_pml * pen_pml + w_mr * mr
+        return obj, score, info, L_ratio, pm_l_share
+
+    best_obj = -1e18
+    best_score = -1e18
+    best_tz = tz_start
     best_info = None
 
     tz = tz_start
-    print("\n[Step1] tz 方向スキャンで初期位置を探索")
+    print("\n[Step1] tz 方向スキャンで初期位置を探索（objective で選択）")
     i = 0
     while tz >= tz_end - 1e-9:
-        score, info = scorer.evaluate(tx0, rx0, ry0, tz)
+        obj, score, info, L_ratio, pm_l_share = objective(tx0, rx0, ry0, tz)
+
         if i % 5 == 0:
             ra = info["region_areas"]
+            rs = info["region_scores"]
             print(
-                f"  tz={tz:6.3f} mm -> score={score:7.3f}, "
+                f"  tz={tz:6.3f} mm -> obj={obj:7.3f}, score={score:7.3f}, "
                 f"area={info['total_area']:.4f}, "
-                f"M_L={ra['M_L']:.3f}, M_R={ra['M_R']:.3f}, "
+                f"L_ratio={L_ratio:.3f}, PM_L_share={pm_l_share:.3f} | "
+                f"[str] M_R={rs['M_R']:.4f}, PM_L={rs['PM_L']:.4f} | "
+                f"[area] M_L={ra['M_L']:.3f}, M_R={ra['M_R']:.3f}, "
                 f"PM_L={ra['PM_L']:.3f}, PM_R={ra['PM_R']:.3f}, ANT={ra['ANT']:.3f}"
             )
-        if score > best_score:
+
+        if obj > best_obj:
+            best_obj = obj
             best_score = score
             best_tz = tz
             best_info = info
+
         tz += step
         i += 1
 
     print(
-        f"\n  → 初期候補: tz={best_tz:.3f} mm, score={best_score:.3f}, "
+        f"\n  → 初期候補: tz={best_tz:.3f} mm, obj={best_obj:.3f}, score={best_score:.3f}, "
         f"area={best_info['total_area']:.4f}"
     )
     return best_tz, best_score, best_info
@@ -353,22 +419,54 @@ def hill_climb_4d(scorer: SpringOcclusionScorer,
                   max_iter=20,
                   tx_min=-0.8, tx_max=0.8,
                   max_rot_deg=5.0,
-                  tz_min=-2.0, tz_max=1.0):
+                  tz_min=-2.0, tz_max=1.0,
+                  # ★バランス補正の重み（まずはこのくらいから）
+                  w_lr=1.2,          # 左右バランス（L_ratio vs target_L_ratio）
+                  w_pml=0.8,         # 左小臼歯（PM_L）偏り抑制
+                  pml_margin=0.10,   # PM_L share “許容マージン”
+                  w_mr=0.4           # 右大臼歯（M_R）を少し押す
+                  ):
     """
     (tx, rx, ry, tz) の4自由度ヒルクライム
-    左右スライド + 前後・左右回転 + 上下
+    ただし比較は score ではなく objective（score + バランス補正）で行う
     """
+
+    def objective(tx, rx, ry, tz):
+        score, info = scorer.evaluate(tx, rx, ry, tz)
+        rs = info["region_scores"]
+
+        L = rs["M_L"] + rs["PM_L"]
+        R = rs["M_R"] + rs["PM_R"]
+        denom = L + R + 1e-12
+        L_ratio = L / denom
+
+        pm_l_share = rs["PM_L"] / (L + 1e-12)
+
+        # 目標からのズレ
+        pen_lr = abs(L_ratio - scorer.target_L_ratio)
+
+        # PM_L偏り：自然比 + margin を超えた分だけ抑える
+        excess = max(0.0, pm_l_share - (scorer.target_PM_L_share + pml_margin))
+        pen_pml = excess
+
+        # 右大臼歯（見た目で右が弱い対策）
+        mr = rs["M_R"]
+
+        obj = score - w_lr * pen_lr - w_pml * pen_pml + w_mr * mr
+        return obj, score, info, L_ratio, pm_l_share
+
     tx = tx_init
     rx = rx_init
     ry = ry_init
     tz = tz_init
 
-    score, info = scorer.evaluate(tx, rx, ry, tz)
-    print("\n[Step2] 近傍ヒルクライム開始")
+    obj, score, info, L_ratio, pm_l_share = objective(tx, rx, ry, tz)
+    print("\n[Step2] 近傍ヒルクライム開始（objective で最適化）")
     print(
         f"  start: tx={tx:.3f}mm, rx={np.rad2deg(rx):.3f}°, "
         f"ry={np.rad2deg(ry):.3f}°, tz={tz:.3f} mm, "
-        f"score={score:.3f}, area={info['total_area']:.4f}"
+        f"obj={obj:.3f}, score={score:.3f}, area={info['total_area']:.4f}, "
+        f"L_ratio={L_ratio:.3f}, PM_L_share={pm_l_share:.3f}"
     )
 
     rad_step = np.deg2rad(deg_step)
@@ -376,9 +474,12 @@ def hill_climb_4d(scorer: SpringOcclusionScorer,
 
     for it in range(max_iter):
         improved = False
+        best_local_obj = obj
+        best_local = (tx, rx, ry, tz)
         best_local_score = score
-        best_local_params = (tx, rx, ry, tz)
         best_local_info = info
+        best_lr = L_ratio
+        best_pml = pm_l_share
 
         for d_tx in [-tx_step, 0.0, tx_step]:
             for d_rx in [-rad_step, 0.0, rad_step]:
@@ -400,29 +501,39 @@ def hill_climb_4d(scorer: SpringOcclusionScorer,
                         if tz_c < tz_min or tz_c > tz_max:
                             continue
 
-                        s_c, info_c = scorer.evaluate(tx_c, rx_c, ry_c, tz_c)
-                        if s_c > best_local_score:
-                            best_local_score = s_c
-                            best_local_params = (tx_c, rx_c, ry_c, tz_c)
+                        obj_c, score_c, info_c, lr_c, pml_c = objective(tx_c, rx_c, ry_c, tz_c)
+
+                        if obj_c > best_local_obj:
+                            best_local_obj = obj_c
+                            best_local = (tx_c, rx_c, ry_c, tz_c)
+                            best_local_score = score_c
                             best_local_info = info_c
+                            best_lr = lr_c
+                            best_pml = pml_c
                             improved = True
 
         if not improved:
             print(f"  it={it}: 改善なし → 終了")
             break
 
-        tx, rx, ry, tz = best_local_params
+        tx, rx, ry, tz = best_local
+        obj = best_local_obj
         score = best_local_score
         info = best_local_info
+        L_ratio = best_lr
+        pm_l_share = best_pml
+
         ra = info["region_areas"]
+        rs = info["region_scores"]
         print(
             f"  it={it+1}: tx={tx:6.3f}mm, rx={np.rad2deg(rx):5.2f}°, "
             f"ry={np.rad2deg(ry):5.2f}°, tz={tz:6.3f} mm, "
-            f"score={score:7.3f}, area={info['total_area']:.4f}, "
-            f"M_L={ra['M_L']:.3f}, M_R={ra['M_R']:.3f}, "
-            f"PM_L={ra['PM_L']:.3f}, PM_R={ra['PM_R']:.3f}, ANT={ra['ANT']:.3f}"
+            f"obj={obj:7.3f}, score={score:7.3f}, area={info['total_area']:.4f}, "
+            f"L_ratio={L_ratio:.3f}, PM_L_share={pm_l_share:.3f}, "
+            f"[str] M_R={rs['M_R']:.4f}, PM_L={rs['PM_L']:.4f}"
         )
 
+    # 返す score/info は “純 score” のもの（従来互換）
     return tx, rx, ry, tz, score, info
 
 
@@ -517,6 +628,17 @@ def main():
     print(f"  dead springs    = {info_best['spring_zero']}")
     print("-" * 80)
 
+    rs = info_best["region_scores"]
+    print("\n  [region_scores (strength)]")
+    print(f"  M_L={rs['M_L']:.6f}, M_R={rs['M_R']:.6f}, "
+          f"PM_L={rs['PM_L']:.6f}, PM_R={rs['PM_R']:.6f}, ANT={rs['ANT']:.6f}")
+
+    left_s  = rs["M_L"] + rs["PM_L"]
+    right_s = rs["M_R"] + rs["PM_R"]
+    denom = left_s + right_s + 1e-9
+    print(f"  L_strength={left_s:.6f}, R_strength={right_s:.6f}, "
+          f"L_ratio={left_s/denom:.3f}")
+
     # ★ Phase2: tz だけを少し「ギュッ」と噛み込ませる
     tz_gyu, score_gyu, info_gyu = gyu_refine_tz(
         scorer,
@@ -545,6 +667,17 @@ def main():
     print(f"  dead springs    = {info_gyu['spring_zero']}")
     print("-" * 80)
 
+    rs2 = info_gyu["region_scores"]
+    print("\n  [region_scores (strength)]")
+    print(f"  M_L={rs2['M_L']:.6f}, M_R={rs2['M_R']:.6f}, "
+          f"PM_L={rs2['PM_L']:.6f}, PM_R={rs2['PM_R']:.6f}, ANT={rs2['ANT']:.6f}")
+
+    left_s2  = rs2["M_L"] + rs2["PM_L"]
+    right_s2 = rs2["M_R"] + rs2["PM_R"]
+    denom2 = left_s2 + right_s2 + 1e-9
+    print(f"  L_strength={left_s2:.6f}, R_strength={right_s2:.6f}, "
+          f"L_ratio={left_s2/denom2:.3f}")
+
     # ★ STL に反映するのは Phase2 後の姿勢
     final_tx = tx_best
     final_rx = rx_best
@@ -564,55 +697,98 @@ def main():
     print(f"\n✓ 最終下顎 STL を保存しました: {out_path}")
     print("=" * 80)
 
-def gyu_refine_tz(
-    scorer: SpringOcclusionScorer,
-    tx, rx, ry, tz_start,
-    extra_depth=0.10,      # どこまで深く探索するか（mm）
-    step=-0.01,            # 探索刻み
-    max_score_drop=0.11,   # Phase1 からどこまでスコア低下を許容するか
-):
-    """
-    Phase1 で決めた tx, rx, ry を固定したまま、
-    tz だけを少しマイナス方向（咬み込み方向）に動かして
-    「ちょっとだけギュッとした」位置を探す。
+def objective(tx, rx, ry, tz, scorer,
+              w_lr=1.2, w_pml=0.8, pml_margin=0.10,
+              w_mr=0.4):
+    score, info = scorer.evaluate(tx, rx, ry, tz)
+    rs = info["region_scores"]
 
-    - Phase1 のスコアから max_score_drop までの悪化は許容
-    - その範囲で「最も深い tz」を採用
-    """
-    # Phase1 の基準スコア
+    L = rs["M_L"] + rs["PM_L"]
+    R = rs["M_R"] + rs["PM_R"]
+    denom = L + R + 1e-12
+    L_ratio = L / denom
+
+    pm_l_share = rs["PM_L"] / (L + 1e-12)
+
+    pen_lr = abs(L_ratio - scorer.target_L_ratio)
+
+    excess = max(0.0, pm_l_share - (scorer.target_PM_L_share + pml_margin))
+    pen_pml = excess
+
+    mr = rs["M_R"]
+
+    obj = score - w_lr * pen_lr - w_pml * pen_pml + w_mr * mr
+    return obj, score, info
+
+def gyu_refine_tz(
+    scorer,
+    tx, rx, ry, tz_start,
+    extra_depth=0.10,
+    step=-0.01,
+    max_score_drop=0.11,
+    w_right_post=0.60,
+    w_pml_pen=0.40,
+    w_depth=0.05,
+):
     base_score, base_info = scorer.evaluate(tx, rx, ry, tz_start)
+
+    def S(info, key):
+        return float(info["region_scores"].get(key, 0.0))
+
+    # ★ tz_start を obj の基準として評価しておく（重要）
+    right_post0 = S(base_info, "M_R") + S(base_info, "PM_R")
+    pml0 = S(base_info, "PM_L")
+    obj0 = (
+        base_score
+        + w_right_post * right_post0
+        - w_pml_pen * pml0
+        + w_depth * 0.0
+    )
 
     best_tz = tz_start
     best_score = base_score
     best_info = base_info
+    best_obj = obj0
 
     tz = tz_start + step
-    tz_limit = tz_start - extra_depth  # 例: tz_start=-0.15, extra_depth=0.10 → -0.25 まで
+    tz_limit = tz_start - extra_depth
 
     print("\n[Phase2: gyu_refine_tz] tz だけ少し『ギュッ』と探索します")
     while tz >= tz_limit - 1e-9:
         score, info = scorer.evaluate(tx, rx, ry, tz)
         ra = info["region_areas"]
+        rs = info["region_scores"]
+
         print(
-            f"  tz={tz:6.3f} mm -> score={score:7.3f}, "
-            f"area={info['total_area']:.4f}, "
-            f"M_L={ra['M_L']:.3f}, M_R={ra['M_R']:.3f}, "
-            f"PM_L={ra['PM_L']:.3f}, PM_R={ra['PM_R']:.3f}, ANT={ra['ANT']:.3f}"
+            f"  tz={tz:6.3f} mm -> score={score:7.3f}, area={info['total_area']:.4f}, "
+            f"[area] M_L={ra['M_L']:.3f}, M_R={ra['M_R']:.3f}, PM_L={ra['PM_L']:.3f}, PM_R={ra['PM_R']:.3f}, ANT={ra['ANT']:.3f} | "
+            f"[str] M_L={rs['M_L']:.6f}, M_R={rs['M_R']:.6f}, PM_L={rs['PM_L']:.6f}, PM_R={rs['PM_R']:.6f}, ANT={rs['ANT']:.6f}"
         )
 
-        # スコア低下が許容範囲内なら「候補」として受け入れる
         if score >= base_score - max_score_drop:
-            # より「深い tz」であれば更新
-            if tz < best_tz:
+            right_post = S(info, "M_R") + S(info, "PM_R")
+            pml = S(info, "PM_L")
+            depth_bonus = (tz_start - tz)
+
+            obj = (
+                score
+                + w_right_post * right_post
+                - w_pml_pen * pml
+                + w_depth * depth_bonus
+            )
+
+            if obj > best_obj:
+                best_obj = obj
                 best_tz = tz
                 best_score = score
                 best_info = info
 
-        tz += step  # step は負なので、だんだん噛み込み方向へ
+        tz += step
 
     print(f"\n  → gyu 結果: tz={best_tz:.3f} mm, score={best_score:.3f}")
     return best_tz, best_score, best_info
 
+   
 
 if __name__ == "__main__":
     main()

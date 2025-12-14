@@ -7,31 +7,107 @@ import trimesh
 from tkinter import Tk, filedialog
 from scipy.spatial.transform import Rotation as R
 
+from dataclasses import dataclass
+
+@dataclass
+class Config:
+    springs: int = 6              # ← ここだけ変えればOKにする
+    contact_threshold: float = 0.03
+    rot_penalty: float = 1.5
+    trans_penalty: float = 2.0
+
+    sample_size: int = 1200
+
+    tz_start: float = 0.5
+    tz_end: float = -1.5
+    tz_scan_step: float = -0.05
+
+    tx_step: float = 0.05
+    deg_step: float = 0.5
+    tz_step: float = 0.05
+    max_iter: int = 20
+
+    tx_min: float = -0.8
+    tx_max: float = 0.8
+    max_rot_deg: float = 5.0
+    tz_min: float = -2.0
+    tz_max: float = 1.0
+
+    gyu_extra_depth: float = 0.10
+    gyu_step: float = -0.01
+    gyu_max_score_drop: float = 0.11  
+
+    @property
+    def n_bands(self):
+        return springs_preset(self.springs)[0]
+
+    @property
+    def merge_front(self):
+        return springs_preset(self.springs)[1]  
+
+cfg = Config() 
+
 
 # =============================
 # ユーティリティ
 # =============================
+def springs_preset(springs: int):
+    """
+    springs 本数 → (n_bands, merge_front) に変換
+    - 4本 : 2バンド×左右
+    - 5本 : 3バンドで前歯だけ左右まとめる（従来）
+    - 6本 : 3バンド×左右
+    - 10本: 5バンド×左右
+    """
+    presets = {
+        4:  (2, False),
+        5:  (3, True),
+        6:  (3, False),
+        10: (5, False),
+    }
+    if springs not in presets:
+        raise ValueError(f"springs は {sorted(presets.keys())} のいずれかにしてください")
+    return presets[springs]
+
+def region_area_str(ra: dict, keys: list[str], digits=3):
+    parts = []
+    for k in keys:
+        parts.append(f"{k}={ra.get(k, 0.0):.{digits}f}")
+    return ", ".join(parts)
 
 def select_two_stl_files():
     """
-    ファイルダイアログから STL ファイルを2つ選択
-    1つ目: 上顎, 2つ目: 下顎 として扱う
+    ファイルダイアログから STL ファイルを2回に分けて選択
+    1回目: 上顎, 2回目: 下顎
     """
     root = Tk()
     root.withdraw()
 
-    filepaths = filedialog.askopenfilenames(
-        title="上顎と下顎の STL ファイルをこの順に2つ選択してください（1つ目: 上顎, 2つ目: 下顎）",
+    upper_path = filedialog.askopenfilename(
+        title="【1/2】上顎の STL ファイルを選択してください",
         filetypes=[("STL files", "*.stl"), ("All files", "*.*")]
     )
+    if not upper_path:
+        print("エラー: 上顎 STL が選択されませんでした。")
+        root.destroy()
+        sys.exit(1)
+
+    lower_path = filedialog.askopenfilename(
+        title="【2/2】下顎の STL ファイルを選択してください",
+        filetypes=[("STL files", "*.stl"), ("All files", "*.*")]
+    )
+    if not lower_path:
+        print("エラー: 下顎 STL が選択されませんでした。")
+        root.destroy()
+        sys.exit(1)
+
     root.update()
     root.destroy()
 
-    if len(filepaths) != 2:
-        print("エラー: STL ファイルは必ず 2 つ選択してください。")
+    if os.path.abspath(upper_path) == os.path.abspath(lower_path):
+        print("エラー: 同じ STL が2回選択されています。上顎と下顎は別ファイルを選んでください。")
         sys.exit(1)
 
-    upper_path, lower_path = filepaths
     print("上顎 STL:", upper_path)
     print("下顎 STL:", lower_path)
     return upper_path, lower_path
@@ -40,7 +116,7 @@ def select_two_stl_files():
 def load_mesh_safely(filepath):
     """trimesh で STL を読み込む（簡易チェック付き）"""
     try:
-        mesh = trimesh.load(filepath)
+        mesh = trimesh.load(filepath, force='mesh')
         if not mesh.is_watertight:
             print(f"警告: {os.path.basename(filepath)} は水密ではありません")
         if len(mesh.vertices) < 100:
@@ -69,17 +145,6 @@ def per_vertex_area(mesh: trimesh.Trimesh):
 # =============================
 
 class SpringOcclusionScorer:
-    """
-    上下歯列を「輪ゴム5本」で引っ張り合うイメージで評価するスコア計算クラス
-
-    5本のバネ:
-      - M_L : 左大臼歯ブロック
-      - M_R : 右大臼歯ブロック
-      - PM_L: 左小臼歯ブロック
-      - PM_R: 右小臼歯ブロック
-      - ANT : 前歯ブロック（左右まとめて）
-    """
-
     def __init__(
         self,
         upper_mesh: trimesh.Trimesh,
@@ -88,62 +153,27 @@ class SpringOcclusionScorer:
         contact_threshold: float = 0.03,
         rot_penalty: float = 1.5,
         trans_penalty: float = 2.0,
+        # ★追加：本数切替用
+        n_bands: int = 3,
+        merge_front: bool = False,   # ★6本なら False（前歯も左右を分ける）
     ):
         self.upper = upper_mesh
-        self.v0 = lower_sample_vertices  # 下顎サンプル頂点（基準座標）
+        self.v0 = lower_sample_vertices
         self.areas = lower_sample_areas
         self.contact_threshold = contact_threshold
         self.rot_penalty = rot_penalty
         self.trans_penalty = trans_penalty
 
-        # ----------------------------
-        # 5ブロックへの自動分割
-        # ----------------------------
-        x = self.v0[:, 0]
-        y = self.v0[:, 1]
+        # ★ここでn本のマスクを作る
+        self.region_masks, self.valid_regions, self.x_mid = build_region_masks(
+            self.v0, n_bands=n_bands, merge_front=merge_front
+        )
 
-        self.x_mid = float(np.median(x))
-        y_min, y_max = float(y.min()), float(y.max())
-        if y_max == y_min:
-            # 万一全て同じ値なら、全部「臼歯」として扱う
-            y_cut1 = y_min - 0.1
-            y_cut2 = y_min + 0.1
-        else:
-            dy = y_max - y_min
-            y_cut1 = y_min + dy / 3.0        # 大臼歯 / 小臼歯の境
-            y_cut2 = y_min + dy * 2.0 / 3.0  # 小臼歯 / 前歯の境
-
-        is_left = x <= self.x_mid
-        is_right = ~is_left
-
-        band_molar = y <= y_cut1
-        band_premolar = (y > y_cut1) & (y <= y_cut2)
-        band_ant = y > y_cut2
-
-        mask_M_L = is_left & band_molar
-        mask_M_R = is_right & band_molar
-        mask_PM_L = is_left & band_premolar
-        mask_PM_R = is_right & band_premolar
-        mask_ANT = band_ant  # 前歯は左右まとめて一本のゴム
-
-        self.region_masks = {
-            "M_L": mask_M_L,
-            "M_R": mask_M_R,
-            "PM_L": mask_PM_L,
-            "PM_R": mask_PM_R,
-            "ANT": mask_ANT,
-        }
-
-        # 実際に頂点が存在するブロックだけを「有効バネ」とみなす
-        self.valid_regions = [
-            name for name, m in self.region_masks.items() if np.any(m)
-        ]
-
-        print("\n[ブロック分割（輪ゴム5本）]")
-        for name in ["M_L", "M_R", "PM_L", "PM_R", "ANT"]:
+        print("\n[ブロック分割（輪ゴムスプリング）]")
+        for name in self.region_masks.keys():
             cnt = int(self.region_masks[name].sum())
             flag = "✓" if name in self.valid_regions else "（頂点なし）"
-            print(f"  {name:5s}: {cnt:4d} 点 {flag}")
+            print(f"  {name:6s}: {cnt:4d} 点 {flag}")
         print(f"  有効バネ本数: {len(self.valid_regions)}")
 
     # ----------------------------
@@ -353,11 +383,11 @@ def line_search_tz(scorer: SpringOcclusionScorer,
         score, info = scorer.evaluate(tx0, rx0, ry0, tz)
         if i % 5 == 0:
             ra = info["region_areas"]
+            keys = scorer.valid_regions
             print(
                 f"  tz={tz:6.3f} mm -> score={score:7.3f}, "
                 f"area={info['total_area']:.4f}, "
-                f"M_L={ra['M_L']:.3f}, M_R={ra['M_R']:.3f}, "
-                f"PM_L={ra['PM_L']:.3f}, PM_R={ra['PM_R']:.3f}, ANT={ra['ANT']:.3f}"
+                f"{region_area_str(ra, keys)}"
             )
         if score > best_score:
             best_score = score
@@ -441,12 +471,12 @@ def hill_climb_4d(scorer: SpringOcclusionScorer,
         score = best_local_score
         info = best_local_info
         ra = info["region_areas"]
+        keys = scorer.valid_regions
         print(
             f"  it={it+1}: tx={tx:6.3f}mm, rx={np.rad2deg(rx):5.2f}°, "
             f"ry={np.rad2deg(ry):5.2f}°, tz={tz:6.3f} mm, "
             f"score={score:7.3f}, area={info['total_area']:.4f}, "
-            f"M_L={ra['M_L']:.3f}, M_R={ra['M_R']:.3f}, "
-            f"PM_L={ra['PM_L']:.3f}, PM_R={ra['PM_R']:.3f}, ANT={ra['ANT']:.3f}"
+            f"{region_area_str(ra, keys)}"
         )
 
     return tx, rx, ry, tz, score, info
@@ -458,7 +488,7 @@ def hill_climb_4d(scorer: SpringOcclusionScorer,
 
 def main():
     print("=" * 80)
-    print("咬頭嵌合位自動最適化（5本の輪ゴムスプリングモデル）")
+    print(f"咬頭嵌合位自動最適化（{cfg.springs}本の輪ゴムスプリングモデル）")
     print("=" * 80)
 
     upper_path, lower_path = select_two_stl_files()
@@ -471,7 +501,7 @@ def main():
 
     all_vertices = lower.vertices
     n_vertices = len(all_vertices)
-    SAMPLE_SIZE = 1200  # 計算時間と精度のバランス
+    SAMPLE_SIZE = cfg.sample_size
 
     if n_vertices > SAMPLE_SIZE:
         rng = np.random.default_rng(0)
@@ -489,38 +519,33 @@ def main():
         upper_mesh=upper,
         lower_sample_vertices=sample_vertices,
         lower_sample_areas=sample_areas,
-        contact_threshold=0.03,  # 0〜0.03mm を「輪ゴムが届いている範囲」とみなす
-        rot_penalty=1.5,
-        trans_penalty=2.0,
+        contact_threshold=cfg.contact_threshold,
+        rot_penalty=cfg.rot_penalty,
+        trans_penalty=cfg.trans_penalty,
+        n_bands=cfg.n_bands,
+        merge_front=cfg.merge_front,
     )
 
     # Step1: tz 方向スキャンで初期位置
     best_tz, best_score_tz, info_tz = line_search_tz(
         scorer,
-        tx0=0.0,
-        rx0=0.0,
-        ry0=0.0,
-        tz_start=0.5,
-        tz_end=-1.5,
-        step=-0.05
+        tx0=0.0, rx0=0.0, ry0=0.0,
+        tz_start=cfg.tz_start,
+        tz_end=cfg.tz_end,
+        step=cfg.tz_scan_step,
     )
 
     # Step2 (Phase1): 近傍ヒルクライム（tx も含めて最適化）
     tx_best, rx_best, ry_best, tz_best, score_best, info_best = hill_climb_4d(
         scorer,
-        tx_init=0.0,
-        rx_init=0.0,
-        ry_init=0.0,
-        tz_init=best_tz,
-        tx_step=0.05,
-        deg_step=0.5,
-        tz_step=0.05,
-        max_iter=20,
-        tx_min=-0.8,
-        tx_max=0.8,
-        max_rot_deg=5.0,
-        tz_min=-2.0,
-        tz_max=1.0,
+        tx_init=0.0, rx_init=0.0, ry_init=0.0, tz_init=best_tz,
+        tx_step=cfg.tx_step,
+        deg_step=cfg.deg_step,
+        tz_step=cfg.tz_step,
+        max_iter=cfg.max_iter,
+        tx_min=cfg.tx_min, tx_max=cfg.tx_max,
+        max_rot_deg=cfg.max_rot_deg,
+        tz_min=cfg.tz_min, tz_max=cfg.tz_max,
     )
 
     print("\nPhase1 結果（ノーマル咬合位置）")
@@ -531,24 +556,23 @@ def main():
     print(f"  tz = {tz_best:6.3f} mm")
     print(f"  score           = {score_best:.3f}")
     print(f"  total area      = {info_best['total_area']:.4f} mm²")
-    ra = info_best["region_areas"]
-    print(f"  M_L area        = {ra['M_L']:.4f} mm²")
-    print(f"  M_R area        = {ra['M_R']:.4f} mm²")
-    print(f"  PM_L area       = {ra['PM_L']:.4f} mm²")
-    print(f"  PM_R area       = {ra['PM_R']:.4f} mm²")
-    print(f"  ANT area        = {ra['ANT']:.4f} mm²")
     print(f"  contacts        = {info_best['num_contacts']} points")
-    print(f"  spring min      = {info_best['spring_min']:.4f}")
-    print(f"  spring var      = {info_best['spring_var']:.4f}")
-    print(f"  dead springs    = {info_best['spring_zero']}")
-    print("-" * 80)
+    print(f"  n_springs       = {info_best['n_springs']}")
+    print(f"  zero_frac       = {info_best['spring_zero_frac']:.3f}")
+    print(f"  cv              = {info_best['spring_cv']:.3f}")
+    print(f"  min_q20         = {info_best['spring_min_q20']:.3f}")
+
+    ra = info_best["region_areas"]
+    for k in scorer.valid_regions:
+        print(f"  {k} area        = {ra.get(k,0.0):.4f} mm²")
 
     # ★ Phase2: tz だけを少し「ギュッ」と噛み込ませる
     tz_gyu, score_gyu, info_gyu = gyu_refine_tz(
         scorer,
         tx_best, rx_best, ry_best, tz_best,
-        extra_depth=0.10,  # ← ギュッとする最大量（mm）。0.05〜0.10 あたりから調整
-        step=-0.01,        # 0.01mm 刻み
+        extra_depth=cfg.gyu_extra_depth,
+        step=cfg.gyu_step,
+        max_score_drop=cfg.gyu_max_score_drop,
     )
 
     print("\n最終結果（Phase2: ちょっとギュッ後）")
@@ -559,17 +583,15 @@ def main():
     print(f"  tz = {tz_gyu:6.3f} mm")              # tz だけ gyu 版
     print(f"  score           = {score_gyu:.3f}")
     print(f"  total area      = {info_gyu['total_area']:.4f} mm²")
-    ra2 = info_gyu["region_areas"]
-    print(f"  M_L area        = {ra2['M_L']:.4f} mm²")
-    print(f"  M_R area        = {ra2['M_R']:.4f} mm²")
-    print(f"  PM_L area       = {ra2['PM_L']:.4f} mm²")
-    print(f"  PM_R area       = {ra2['PM_R']:.4f} mm²")
-    print(f"  ANT area        = {ra2['ANT']:.4f} mm²")
     print(f"  contacts        = {info_gyu['num_contacts']} points")
-    print(f"  spring min      = {info_gyu['spring_min']:.4f}")
-    print(f"  spring var      = {info_gyu['spring_var']:.4f}")
-    print(f"  dead springs    = {info_gyu['spring_zero']}")
-    print("-" * 80)
+    print(f"  n_springs       = {info_gyu['n_springs']}")
+    print(f"  zero_frac       = {info_gyu['spring_zero_frac']:.3f}")
+    print(f"  cv              = {info_gyu['spring_cv']:.3f}")
+    print(f"  min_q20         = {info_gyu['spring_min_q20']:.3f}")
+
+    ra = info_gyu["region_areas"]
+    for k in scorer.valid_regions:
+        print(f"  {k} area        = {ra.get(k,0.0):.4f} mm²")
 
     # ★ STL に反映するのは Phase2 後の姿勢
     final_tx = tx_best
@@ -585,7 +607,7 @@ def main():
 
     out_dir = os.path.dirname(lower_path)
     lower_name = os.path.splitext(os.path.basename(lower_path))[0]
-    out_path = os.path.join(out_dir, f"{lower_name}_spring5_balanced_gyu.stl")  # ★ファイル名も分けておく
+    out_path = os.path.join(out_dir, f"{lower_name}_spring{cfg.springs}_balanced_gyu.stl")  # ★ファイル名も分けておく
     lower_out.export(out_path)
     print(f"\n✓ 最終下顎 STL を保存しました: {out_path}")
     print("=" * 80)
@@ -616,25 +638,26 @@ def gyu_refine_tz(
     tz_limit = tz_start - extra_depth  # 例: tz_start=-0.15, extra_depth=0.10 → -0.25 まで
 
     print("\n[Phase2: gyu_refine_tz] tz だけ少し『ギュッ』と探索します")
+    keys = scorer.valid_regions  # ←有効なバネ名（B1_L など）が入る
+
     while tz >= tz_limit - 1e-9:
         score, info = scorer.evaluate(tx, rx, ry, tz)
         ra = info["region_areas"]
+
         print(
             f"  tz={tz:6.3f} mm -> score={score:7.3f}, "
             f"area={info['total_area']:.4f}, "
-            f"M_L={ra['M_L']:.3f}, M_R={ra['M_R']:.3f}, "
-            f"PM_L={ra['PM_L']:.3f}, PM_R={ra['PM_R']:.3f}, ANT={ra['ANT']:.3f}"
+            f"{region_area_str(ra, keys)}"
         )
 
         # スコア低下が許容範囲内なら「候補」として受け入れる
         if score >= base_score - max_score_drop:
-            # より「深い tz」であれば更新
             if tz < best_tz:
                 best_tz = tz
                 best_score = score
                 best_info = info
 
-        tz += step  # step は負なので、だんだん噛み込み方向へ
+        tz += step
 
     print(f"\n  → gyu 結果: tz={best_tz:.3f} mm, score={best_score:.3f}")
     return best_tz, best_score, best_info
