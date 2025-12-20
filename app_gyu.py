@@ -468,7 +468,12 @@ class SpringOcclusionScorer:
             # メモリ効率を考慮してfloat32使用
             self.v0_gpu = array_to_gpu(self.v0.astype(np.float32))
             self.areas_gpu = array_to_gpu(self.areas.astype(np.float32))
-            self.upper_vertices_gpu = array_to_gpu(upper_mesh.vertices.astype(np.float32))
+            
+            # 上顎は表面サンプル点を使用（頂点ではなく面への最近接に近づける）
+            n_upper_samples = 50000  # サンプル数（調整可能）
+            upper_surface_points, _ = trimesh.sample.sample_surface(upper_mesh, n_upper_samples)
+            self.upper_vertices_gpu = array_to_gpu(upper_surface_points.astype(np.float32))
+            
             self.pivot_gpu = array_to_gpu(self.pivot)
             
             # GPUメモリ使用量を表示
@@ -477,9 +482,9 @@ class SpringOcclusionScorer:
                 self.upper_vertices_gpu.nbytes
             ) / (1024 * 1024)
             
-            print(f"✓ GPU メモリに転送完了: {len(self.v0)} 下顎頂点, {len(upper_mesh.vertices)} 上顎頂点")
+            print(f"✓ GPU メモリに転送完了: {len(self.v0)} 下顎頂点, {n_upper_samples} 上顎表面サンプル点")
             print(f"✓ GPU メモリ使用量: {gpu_memory_mb:.1f} MB")
-            print(f"⚠️  注意: GPU距離は上顎【頂点】への最近接（CPU=三角形面への最近接と異なる）")
+            print(f"✓ 改善: GPU距離は上顎【表面サンプル点】への最近接（CPU三角形面への最近接に近似）")
             
             # メモリ使用量チェック
             if hasattr(cp, 'get_default_memory_pool'):
