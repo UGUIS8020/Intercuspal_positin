@@ -4,4 +4,6 @@ venv
 *.sqlite
 *.stl
 *.zip
+*.npz
+*.bak
 migrations
