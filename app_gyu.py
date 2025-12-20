@@ -727,7 +727,8 @@ class SpringOcclusionScorer:
                 continue
             d = distances[mask]
             out[name] = {
-            "min": float(d.min()),
+            # 安定性向上: min → 1%点に変更
+            "min": float(np.partition(d, max(1, int(0.01 * d.size)))[max(1, int(0.01 * d.size))]) if d.size > 0 else 999.0,
             "p10": float(np.percentile(d, 10)),
             "p25": float(np.percentile(d, 25)),  # 四分位点追加で分布把握強化
             "near_count": int(np.sum(d <= near_th)),
@@ -801,7 +802,9 @@ class SpringOcclusionScorer:
             transformed = (rot @ (self.v0 - p).T).T + p + np.array([tx, ty, tz])
             _, distances, _ = self.upper.nearest.on_surface(transformed)
             dist_raw = np.asarray(distances)  # 生距離
-            min_dist_raw = float(dist_raw.min())
+            # 安定性向上: min → 1%点に変更（サンプル取りこぼしに強い）
+            k = max(1, int(0.01 * dist_raw.size))
+            min_dist_raw = float(np.partition(dist_raw, k)[k])
             
             # 🔍 距離分布診断（初回のみ表示）
             if not hasattr(self, '_dist_diagnosed'):
@@ -840,7 +843,9 @@ class SpringOcclusionScorer:
             distances_corrected = cp.clip(distances_corrected, 0.0, float('inf'))  # 負値クリップ
             
             dist_raw = distances_corrected  # 生距離
-            min_dist_raw = float(array_to_cpu(cp.min(dist_raw)))
+            # 安定性向上: min → 1%点に変更（サンプル取りこぼしに強い）
+            k = max(1, int(0.01 * dist_raw.size))
+            min_dist_raw = float(array_to_cpu(cp.partition(dist_raw.ravel(), k)[k]))
             
             # ✅ Step0修正: 接触判定は生距離で行う（クリップ前）
             current_threshold = self.contact_threshold_search if self.search_mode else self.contact_threshold_final
