@@ -470,7 +470,7 @@ class SpringOcclusionScorer:
             self.areas_gpu = array_to_gpu(self.areas.astype(np.float32))
             
             # 上顎は表面サンプル点を使用（頂点ではなく面への最近接に近づける）
-            n_upper_samples = 50000  # サンプル数（調整可能）
+            n_upper_samples = 100000  # サンプル数（調整可能）
             upper_surface_points, _ = trimesh.sample.sample_surface(upper_mesh, n_upper_samples)
             self.upper_vertices_gpu = array_to_gpu(upper_surface_points.astype(np.float32))
             
@@ -1468,9 +1468,27 @@ def hill_climb_4d(scorer: SpringOcclusionScorer,
             if (not force_cpu_eval) and GPU_AVAILABLE and len(neighbor_poses) > 2:  # より積極的にGPUバッチ評価を使用
                 batch_scores, batch_infos = scorer.evaluate_batch(neighbor_poses)
                 
+                # GPU評価でobjective計算
+                gpu_candidates = []
                 for i, (pose, score_c, info_c) in enumerate(zip(neighbor_poses, batch_scores, batch_infos)):
                     tx_c, rx_c, ry_c, tz_c = pose
-                    # 🔧 修正3: objective_from_info を使って二重評価を回避
+                    obj_c, comp_c = objective_from_info(score_c, info_c, scorer, w_lr, w_pml, pml_margin, w_mr)
+                    gpu_candidates.append({
+                        'pose': (tx_c, rx_c, ry_c, tz_c),
+                        'obj': obj_c,
+                        'score': score_c,
+                        'info': info_c,
+                        'comp': comp_c
+                    })
+                
+                # 上位K個をCPU strictで確定評価（改善判定はCPU結果で行う）
+                gpu_candidates.sort(key=lambda x: x['obj'], reverse=True)
+                top_k = min(8, len(gpu_candidates))  # 上位8個まで
+                
+                for cand in gpu_candidates[:top_k]:
+                    tx_c, rx_c, ry_c, tz_c = cand['pose']
+                    # CPU strict評価で確定
+                    score_c, info_c = scorer.evaluate(tx_c, rx_c, ry_c, tz_c, force_cpu=True)
                     obj_c, comp_c = objective_from_info(score_c, info_c, scorer, w_lr, w_pml, pml_margin, w_mr)
                     
                     if obj_c > best_local_obj:
@@ -1998,12 +2016,12 @@ def main():
     # ========================================
     # Phase3: CPU確定モード（0.035mm）で最終リファイン
     # ========================================
-    print(f"\n{'='*80}")
-    print(f"[Phase3] CPU確定モード(0.035mm)で最終リファインします")
-    print(f"{'='*80}")
+    print(f"\n{'='*80}", flush=True)
+    print(f"[Phase3] CPU確定モード(0.035mm)で最終リファインします", flush=True)
+    print(f"{'='*80}", flush=True)
     scorer.search_mode = False  # 確定モード（閾値0.035）
     # ⚠️  biasは初期診断時に固定されているため、再測定せず全Phaseで再利用
-    print(f"  🔧 GPU bias={scorer.gpu_bias:+.4f}mm（初期診断から再利用）")
+    print(f"  🔧 GPU bias={scorer.gpu_bias:+.4f}mm（初期診断から再利用）", flush=True)
 
     # ✅ Phase3開始前に、Phase2の最終姿勢で strict再評価（obj/score/info を統一）
     print(f"\n🔍 Phase3開始前: Phase2最終姿勢(tx={tx_best:.3f}, tz={tz_gyu:.3f})を strict で再評価...")
