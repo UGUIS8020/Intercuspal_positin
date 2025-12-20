@@ -33,6 +33,111 @@ def array_to_cpu(arr):
 
 
 # =============================
+# 深噛み検出のロバスト化
+# =============================
+
+def compute_deep_metrics(distances, k_ratio=0.005, k_min=6):
+    """
+    距離配列から複数のロバストな指標を計算する。
+    
+    Parameters
+    ----------
+    distances : np.ndarray
+        距離配列
+    k_ratio : float
+        下位点選択の割合（デフォルト0.5%）
+    k_min : int
+        最小選択点数（デフォルト6点）
+    
+    Returns
+    -------
+    dict
+        min_abs: 絶対最小値（参考用）
+        min_p1: 下位1%点
+        deep_guard: 下位k点の中央値（ロバストな深噛み判定値）
+        k: 実際に使用した下位点数
+    
+    Notes
+    -----
+    - （追加依存を避けた距離計算：gpu_min_distances）
+    """
+    n = len(distances)
+    k = max(k_min, int(n * k_ratio))
+    k = min(k, n)  # 配列サイズを超えないように
+    
+    # 下位k点を取得（O(n)）
+    lower_k = np.partition(distances, k-1)[:k]
+    
+    return {
+        'min_abs': float(np.min(distances)),
+        'min_p1': float(np.percentile(distances, 1.0)),
+        'deep_guard': float(np.median(lower_k)),
+        'k': k
+    }
+
+
+def gpu_min_distances(points_a, points_b, batch_a=256, block_b=8192):
+    """
+    GPU加速版の最小距離計算（点群AからBへの最短距離）
+    
+    Parameters
+    ----------
+    points_a : cp.ndarray or np.ndarray
+        形状 (N, 3) のクエリ点群
+    points_b : cp.ndarray or np.ndarray
+        形状 (M, 3) のターゲット点群
+    batch_a : int
+        Aのバッチサイズ
+    block_b : int
+        Bのブロックサイズ
+    
+    Returns
+    -------
+    cp.ndarray
+        各点の最小距離 (N,)
+    
+    Notes
+    -----
+    - 追加依存（cuVS/pylibraft）を避けた GPU 距離最小化（gpu_min_distances）
+    - メモリ効率的なバッチ処理実装
+    """
+    if not GPU_AVAILABLE:
+        # CPU fallback
+        from scipy.spatial.distance import cdist
+        dists = cdist(points_a, points_b, metric='euclidean')
+        return np.min(dists, axis=1)
+    
+    points_a_gpu = array_to_gpu(points_a)
+    points_b_gpu = array_to_gpu(points_b)
+    
+    n_a = points_a_gpu.shape[0]
+    n_b = points_b_gpu.shape[0]
+    
+    min_dists = cp.full(n_a, cp.inf, dtype=cp.float32)
+    
+    for i_a in range(0, n_a, batch_a):
+        end_a = min(i_a + batch_a, n_a)
+        batch_points = points_a_gpu[i_a:end_a]
+        
+        batch_min = cp.full(end_a - i_a, cp.inf, dtype=cp.float32)
+        
+        for j_b in range(0, n_b, block_b):
+            end_b = min(j_b + block_b, n_b)
+            block_points = points_b_gpu[j_b:end_b]
+            
+            # ユークリッド距離計算: ||a - b||
+            diff = batch_points[:, cp.newaxis, :] - block_points[cp.newaxis, :, :]
+            dists = cp.sqrt(cp.sum(diff ** 2, axis=2))
+            
+            block_min = cp.min(dists, axis=1)
+            batch_min = cp.minimum(batch_min, block_min)
+        
+        min_dists[i_a:end_a] = batch_min
+    
+    return min_dists
+
+
+# =============================
 # ユーティリティ
 # =============================
 
