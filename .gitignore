@@ -6,4 +6,5 @@ venv
 *.zip
 *.npz
 *.bak
+*_backup.py
 migrations

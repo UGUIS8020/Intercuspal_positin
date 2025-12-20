@@ -408,7 +408,7 @@ class SpringOcclusionScorer:
         #    → 回転・移動ペナルティ + 大きなマイナス定数
         #       （どんな「噛んでいる姿勢」より必ず不利にする）
         # --------------------------------------------------
-        contact_count = cp.sum(contact_mask_gpu)
+        contact_count = int(array_to_cpu(cp.sum(contact_mask_gpu))) if GPU_AVAILABLE else int(np.sum(contact_mask_gpu))
         if contact_count == 0:
             rot_pen = self.rot_penalty * (abs(rx_rad) + abs(ry_rad))
             trans_pen = self.trans_penalty * np.sqrt(tx * tx + tz * tz)
