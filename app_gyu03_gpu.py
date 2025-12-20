@@ -1,4 +1,4 @@
-import os
+﻿import os
 import sys
 import numpy as np
 import trimesh
@@ -8,13 +8,15 @@ from scipy.spatial.transform import Rotation as R
 # GPU加速の設定
 try:
     import cupy as cp
-    from cupyx.scipy.spatial.distance import cdist as cu_cdist
     GPU_AVAILABLE = True
     print("✓ CuPy GPU加速が利用可能です")
 except ImportError:
     print("⚠ CuPy が見つかりません。CPU版で動作します。")
     import numpy as cp  # fallback to numpy
     GPU_AVAILABLE = False
+
+# NOTE:
+# 距離計算は gpu_min_distances() を使用する（追加依存: cuVS/pylibraft が必要になる実装は避ける）
 
 def array_to_gpu(arr):
     """numpy array をGPUに転送"""
@@ -381,9 +383,11 @@ class SpringOcclusionScorer:
             distances_gpu = self._gpu_nearest_distances(transformed_gpu)
             d_gpu = cp.clip(distances_gpu, 0.0, max_dist_clip)
             contact_mask_gpu = d_gpu <= self.contact_threshold
-        
-        # *** 🔍 CRITICAL DEBUG: 生の最短距離を記録 ***
-        min_dist_raw = float(array_to_cpu(cp.min(distances_gpu)))
+            
+            # *** 🔍 CRITICAL DEBUG: 生の最短距離を記録 ***
+            min_dist_raw = float(array_to_cpu(cp.min(distances_gpu)))
+            
+            if not hasattr(self, '_gpu_calc_notified'):
                 if hasattr(cp, 'get_default_memory_pool'):
                     mempool = cp.get_default_memory_pool()
                     print(f"   GPU使用中: {mempool.used_bytes()/(1024*1024):.1f} MB")
@@ -1051,3 +1055,5 @@ def gyu_refine_tz(
 
 if __name__ == "__main__":
     main()
+
+

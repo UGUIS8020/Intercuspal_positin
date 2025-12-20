@@ -1,4 +1,4 @@
-import os
+﻿import os
 import sys
 import argparse
 import numpy as np
@@ -9,13 +9,15 @@ from scipy.spatial.transform import Rotation as R
 # GPU加速の設定
 try:
     import cupy as cp
-    from cupyx.scipy.spatial.distance import cdist as cu_cdist
     GPU_AVAILABLE = True
     print("✓ CuPy GPU加速が利用可能です")
 except ImportError:
     print("⚠ CuPy が見つかりません。CPU版で動作します。")
     import numpy as cp  # fallback to numpy
     GPU_AVAILABLE = False
+
+# NOTE:
+# 距離計算は gpu_min_distances() を使用する（追加依存: cuVS/pylibraft が必要になる実装は避ける）
 
 def array_to_gpu(arr):
     """numpy array をGPUに転送"""
@@ -2314,3 +2316,4 @@ def gyu_refine_tz(
 
 if __name__ == "__main__":
     main()
+
