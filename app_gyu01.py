@@ -1,12 +1,10 @@
-﻿import os
+import os
 import sys
 import argparse
 import numpy as np
 import trimesh
 from tkinter import Tk, filedialog
 from scipy.spatial.transform import Rotation as R
-
-from utils import load_mesh_safely
 
 # GPU加速の設定
 try:
@@ -277,70 +275,70 @@ def select_two_stl_files():
     print("=" * 50)
     return upper_path, lower_path
 
-# def load_mesh_safely(filepath, allow_non_watertight=True):
-#     """trimesh で STL を読み込む（自動修復 + 水密チェック）"""
-#     try:
-#         mesh = trimesh.load(filepath)
+def load_mesh_safely(filepath, allow_non_watertight=True):
+    """trimesh で STL を読み込む（自動修復 + 水密チェック）"""
+    try:
+        mesh = trimesh.load(filepath)
         
-#         if len(mesh.vertices) < 100:
-#             raise ValueError(f"頂点数が少なすぎます: {len(mesh.vertices)}")
+        if len(mesh.vertices) < 100:
+            raise ValueError(f"頂点数が少なすぎます: {len(mesh.vertices)}")
         
-#         # 初期状態チェック
-#         is_watertight_before = mesh.is_watertight
+        # 初期状態チェック
+        is_watertight_before = mesh.is_watertight
         
-#         if not is_watertight_before:
-#             print(f"\n⚠️  {os.path.basename(filepath)} が非水密です。自動修復を試行中...")
-#             # 自動修復実行（aggressiveモードで強力に修復）
-#             mesh = repair_mesh(mesh, os.path.basename(filepath), aggressive=True)
+        if not is_watertight_before:
+            print(f"\n⚠️  {os.path.basename(filepath)} が非水密です。自動修復を試行中...")
+            # 自動修復実行（aggressiveモードで強力に修復）
+            mesh = repair_mesh(mesh, os.path.basename(filepath), aggressive=True)
         
-#         # 修復後の水密チェック
-#         is_watertight = mesh.is_watertight
+        # 修復後の水密チェック
+        is_watertight = mesh.is_watertight
         
-#         if not is_watertight:
-#             # 修復に失敗した場合
-#             if allow_non_watertight:
-#                 # 非水密でも続行を許可
-#                 print(f"\n{'='*70}")
-#                 print(f"⚠️  警告: {os.path.basename(filepath)} は非水密のまま続行します")
-#                 print(f"{'='*70}")
-#                 print(f"  ⚠️  結果の精度・再現性が低下する可能性があります")
-#                 print(f"  📌 より正確な結果が必要な場合は、MeshLabで修復してください")
-#                 print(f"{'='*70}\n")
-#             else:
-#                 # 処理を中止
-#                 print(f"\n{'='*70}")
-#                 print(f"❌ エラー: {os.path.basename(filepath)} の自動修復に失敗しました")
-#                 print(f"{'='*70}")
-#                 print(f"\n【原因】")
-#                 print(f"  • STLに修復不可能な構造的欠陥があります")
-#                 print(f"  • 穴が大きすぎる、非多様体エッジが複雑など")
-#                 print(f"\n【影響】")
-#                 print(f"  • GPU vs CPU距離バイアスが0.09~0.11mm級に拡大")
-#                 print(f"  • 接触閾値0.035mmの精度が完全に破綻")
-#                 print(f"  • 最適化結果の再現性がなくなります")
-#                 print(f"\n【必須対応】MeshLabで手動修復してください:")
-#                 print(f"  1. MeshLabでSTLを開く")
-#                 print(f"  2. Filters → Cleaning and Repairing → Fill Holes")
-#                 print(f"  3. Filters → Cleaning and Repairing → Remove Non-Manifold Edges")
-#                 print(f"  4. Filters → Cleaning and Repairing → Remove Duplicate Faces")
-#                 print(f"  5. Filters → Cleaning and Repairing → Remove Zero Area Faces")
-#                 print(f"  6. File → Export Mesh As... で保存")
-#                 print(f"  7. 再度このプログラムを実行")
-#                 print(f"\n非水密STLでは信頼できる結果が得られないため、処理を中止します。")
-#                 print(f"\n💡 テスト目的で続行したい場合: --allow-non-watertight オプションを使用")
-#                 print(f"{'='*70}\n")
-#                 sys.exit(1)
+        if not is_watertight:
+            # 修復に失敗した場合
+            if allow_non_watertight:
+                # 非水密でも続行を許可
+                print(f"\n{'='*70}")
+                print(f"⚠️  警告: {os.path.basename(filepath)} は非水密のまま続行します")
+                print(f"{'='*70}")
+                print(f"  ⚠️  結果の精度・再現性が低下する可能性があります")
+                print(f"  📌 より正確な結果が必要な場合は、MeshLabで修復してください")
+                print(f"{'='*70}\n")
+            else:
+                # 処理を中止
+                print(f"\n{'='*70}")
+                print(f"❌ エラー: {os.path.basename(filepath)} の自動修復に失敗しました")
+                print(f"{'='*70}")
+                print(f"\n【原因】")
+                print(f"  • STLに修復不可能な構造的欠陥があります")
+                print(f"  • 穴が大きすぎる、非多様体エッジが複雑など")
+                print(f"\n【影響】")
+                print(f"  • GPU vs CPU距離バイアスが0.09~0.11mm級に拡大")
+                print(f"  • 接触閾値0.035mmの精度が完全に破綻")
+                print(f"  • 最適化結果の再現性がなくなります")
+                print(f"\n【必須対応】MeshLabで手動修復してください:")
+                print(f"  1. MeshLabでSTLを開く")
+                print(f"  2. Filters → Cleaning and Repairing → Fill Holes")
+                print(f"  3. Filters → Cleaning and Repairing → Remove Non-Manifold Edges")
+                print(f"  4. Filters → Cleaning and Repairing → Remove Duplicate Faces")
+                print(f"  5. Filters → Cleaning and Repairing → Remove Zero Area Faces")
+                print(f"  6. File → Export Mesh As... で保存")
+                print(f"  7. 再度このプログラムを実行")
+                print(f"\n非水密STLでは信頼できる結果が得られないため、処理を中止します。")
+                print(f"\n💡 テスト目的で続行したい場合: --allow-non-watertight オプションを使用")
+                print(f"{'='*70}\n")
+                sys.exit(1)
         
-#         if is_watertight_before:
-#             print(f"✓ {os.path.basename(filepath)} 読み込み ({len(mesh.vertices)} 頂点, 水密)")
-#         else:
-#             print(f"✓ {os.path.basename(filepath)} 自動修復成功 ({len(mesh.vertices)} 頂点, 水密)")
+        if is_watertight_before:
+            print(f"✓ {os.path.basename(filepath)} 読み込み ({len(mesh.vertices)} 頂点, 水密)")
+        else:
+            print(f"✓ {os.path.basename(filepath)} 自動修復成功 ({len(mesh.vertices)} 頂点, 水密)")
         
-#         return mesh
-#     except Exception as e:
-#         print(f"エラー: {filepath} の読み込みに失敗しました")
-#         print("詳細:", e)
-#         sys.exit(1)
+        return mesh
+    except Exception as e:
+        print(f"エラー: {filepath} の読み込みに失敗しました")
+        print("詳細:", e)
+        sys.exit(1)
 
 
 def per_vertex_area(mesh: trimesh.Trimesh):
@@ -544,7 +542,7 @@ class SpringOcclusionScorer:
             self.areas_gpu = array_to_gpu(self.areas.astype(np.float32))
             
             # 上顎は表面サンプル点を使用（頂点ではなく面への最近接に近づける）
-            n_upper_samples = 100000  # サンプル数（調整可能）
+            n_upper_samples = 80000  # サンプル数（調整可能）
             upper_surface_points, _ = trimesh.sample.sample_surface(upper_mesh, n_upper_samples)
             self.upper_vertices_gpu = array_to_gpu(upper_surface_points.astype(np.float32))
             

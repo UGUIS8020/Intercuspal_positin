@@ -4,4 +4,7 @@ venv
 *.sqlite
 *.stl
 *.zip
+*.npz
+*.bak
+*_backup.py
 migrations
