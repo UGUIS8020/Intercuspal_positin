@@ -10,7 +10,7 @@ from scipy.spatial.transform import Rotation as R
 try:
     import cupy as cp
     GPU_AVAILABLE = True
-    print("✓ CuPy GPU加速が利用可能です")
+    print("[OK] CuPy GPU加速が利用可能です")
 except ImportError:
     print("⚠ CuPy が見つかりません。CPU版で動作します。")
     import numpy as cp  # fallback to numpy

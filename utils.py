@@ -55,14 +55,14 @@ def decimate_mesh_by_reduction(mesh: trimesh.Trimesh,
     original_faces = int(len(mesh.faces))
     if original_faces <= max(0, int(min_faces)):
         if verbose:
-            print(f"✓ decimate skip: faces={original_faces} <= min_faces={min_faces}")
+            print(f"[INFO] decimate skip: faces={original_faces} <= min_faces={min_faces}")
         return mesh
 
     target_faces = int(original_faces * (1.0 - reduction))
     target_faces = max(target_faces, 10)  # 最低限
 
     if verbose:
-        print(f"🔧 decimate: faces {original_faces:,} → {target_faces:,} (reduction={reduction:.0%})")
+        print(f"[INFO] decimate: faces {original_faces:,} -> {target_faces:,} (reduction={reduction:.0%})")
 
     try:
         # Trimesh → Open3D
@@ -78,12 +78,12 @@ def decimate_mesh_by_reduction(mesh: trimesh.Trimesh,
             raise RuntimeError("simplify returned empty mesh")
 
         if verbose:
-            print(f"✓ decimate done: faces={len(simplified.faces):,}, verts={len(simplified.vertices):,}")
+            print(f"[INFO] decimate done: faces={len(simplified.faces):,}, verts={len(simplified.vertices):,}")
         return simplified
 
     except Exception as e:
         if verbose:
-            print("⚠ decimate failed, returning original mesh")
+            print("[WARN] decimate failed, returning original mesh")
             print("   reason:", repr(e))
         return mesh
 
@@ -95,9 +95,9 @@ def load_mesh_safely(filepath):
         mesh = _as_trimesh(mesh)
 
         if len(mesh.vertices) < 100:
-            raise ValueError(f"頂点数が少なすぎます: {len(mesh.vertices)}")
+            raise ValueError(f"Too few vertices: {len(mesh.vertices)}")
 
-        # ★ここで簡略化（任意）
+        # Optional: decimation
         if DECIMATE_ENABLED and DECIMATE_REDUCTION > 0:
             mesh = decimate_mesh_by_reduction(
                 mesh,
@@ -106,23 +106,23 @@ def load_mesh_safely(filepath):
                 verbose=DECIMATE_VERBOSE
             )
 
-        # 水密チェック（簡略化後）
+        # Watertight check (after decimation)
         is_watertight = mesh.is_watertight
         if not is_watertight:
-            print(f"\n{'='*70}")
-            print(f"⚠️  重要警告: {os.path.basename(filepath)} は水密ではありません")
-            print(f"{'='*70}")
-            print(f"\n【注意】本プログラムは継続しますが、結果の信頼性に注意してください")
-            print(f"{'='*70}\n")
+            print("\n" + "="*70)
+            print(f"[WARN] {os.path.basename(filepath)} is NOT watertight.")
+            print("="*70)
+            print("[WARN] The program will continue, but results may be unreliable.")
+            print("="*70 + "\n")
 
-        status = "✓" if is_watertight else "⚠"
-        watertight_str = "水密" if is_watertight else "非水密"
-        print(f"{status} {os.path.basename(filepath)} 読み込み "
-              f"({len(mesh.vertices):,} 頂点, {len(mesh.faces):,} 面, {watertight_str})")
+        status = "OK" if is_watertight else "WARN"
+        watertight_str = "watertight" if is_watertight else "not watertight"
+        print(f"[{status}] {os.path.basename(filepath)} loaded "
+              f"({len(mesh.vertices):,} vertices, {len(mesh.faces):,} faces, {watertight_str})")
 
         return mesh
 
     except Exception as e:
-        print(f"エラー: {filepath} の読み込みに失敗しました")
-        print("詳細:", e)
+        print(f"[ERR] Failed to load: {filepath}")
+        print("[ERR] Details:", e)
         sys.exit(1)
