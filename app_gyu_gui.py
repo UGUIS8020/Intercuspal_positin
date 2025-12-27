@@ -64,6 +64,9 @@ class OcclusionOptimizerGUI:
         # パラメータ変数
         self.move_mode = tk.StringVar(value="lower")
         self.sample_size = tk.IntVar(value=1200)
+        # 全顎/片顎モード
+        self.arch_mode = tk.StringVar(value="full")  # "full" or "partial"
+        self.arch_side = tk.StringVar(value="right")  # "right" or "left"
         
         self.is_running = False
         self.process = None
@@ -77,14 +80,21 @@ class OcclusionOptimizerGUI:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         main_frame.columnconfigure(1, weight=1)
-        
+
         row = 0
-        
+        # 動かす顎の選択
+        move_frame = ttk.Frame(main_frame)
+        move_frame.grid(row=row, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 5))
+        ttk.Label(move_frame, text="動かす顎:").grid(row=0, column=0, sticky=tk.W)
+        ttk.Radiobutton(move_frame, text="下顎（Lower）", variable=self.move_mode, value="lower").grid(row=0, column=1, padx=5)
+        ttk.Radiobutton(move_frame, text="上顎（Upper）", variable=self.move_mode, value="upper").grid(row=0, column=2, padx=5)
+        row += 1
+
         # ファイル選択セクション
         ttk.Label(main_frame, text="STLファイル選択", font=("", 12, "bold")).grid(
             row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 10))
         row += 1
-        
+
         # 上顎STL
         ttk.Label(main_frame, text="上顎STL:").grid(row=row, column=0, sticky=tk.W)
         ttk.Entry(main_frame, textvariable=self.upper_stl_path, width=50).grid(
@@ -113,63 +123,70 @@ class OcclusionOptimizerGUI:
         ttk.Separator(main_frame, orient=tk.HORIZONTAL).grid(
             row=row, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10)
         row += 1
-        
+
         ttk.Label(main_frame, text="最適化パラメータ", font=("", 12, "bold")).grid(
             row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 10))
         row += 1
-        
-        # 出力モード選択
-        param_frame = ttk.Frame(main_frame)
-        param_frame.grid(row=row, column=0, columnspan=3, sticky=(tk.W, tk.E))
-        
-        ttk.Label(param_frame, text="出力モード:").grid(row=0, column=0, sticky=tk.W)
-        ttk.Radiobutton(param_frame, text="下顎を動かす", 
-                       variable=self.move_mode, value="lower").grid(row=0, column=1, padx=5)
-        ttk.Radiobutton(param_frame, text="上顎を動かす", 
-                       variable=self.move_mode, value="upper").grid(row=0, column=2, padx=5)
-        
+
+        # 全顎/片顎モード選択
+        arch_frame = ttk.Frame(main_frame)
+        arch_frame.grid(row=row, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 5))
+        ttk.Label(arch_frame, text="モード:").grid(row=0, column=0, sticky=tk.W)
+        ttk.Radiobutton(arch_frame, text="全顎", variable=self.arch_mode, value="full", command=self.update_arch_mode).grid(row=0, column=1, padx=5)
+        ttk.Radiobutton(arch_frame, text="片顎", variable=self.arch_mode, value="partial", command=self.update_arch_mode).grid(row=0, column=2, padx=5)
+        # 片顎時の左右選択
+        self.arch_side_frame = ttk.Frame(arch_frame)
+        self.arch_side_frame.grid(row=0, column=3, padx=10)
+        ttk.Label(self.arch_side_frame, text="側:").grid(row=0, column=0, sticky=tk.W)
+        self.right_rb = ttk.Radiobutton(self.arch_side_frame, text="右側", variable=self.arch_side, value="right")
+        self.right_rb.grid(row=0, column=1, padx=2)
+        self.left_rb = ttk.Radiobutton(self.arch_side_frame, text="左側", variable=self.arch_side, value="left")
+        self.left_rb.grid(row=0, column=2, padx=2)
+
+        # 初期状態は非表示
+        self.arch_side_frame.grid_remove()
         row += 1
-        
-        param_frame2 = ttk.Frame(main_frame)
-        param_frame2.grid(row=row, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
-        
-        ttk.Label(param_frame2, text="サンプル頂点数:").grid(row=0, column=0, sticky=tk.W)
-        ttk.Entry(param_frame2, textvariable=self.sample_size, width=10).grid(row=0, column=1, padx=5)
-        
-        row += 1
-        
-        # 実行ボタン
-        ttk.Separator(main_frame, orient=tk.HORIZONTAL).grid(
-            row=row, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10)
-        row += 1
-        
-        button_frame = ttk.Frame(main_frame)
-        button_frame.grid(row=row, column=0, columnspan=3)
-        
-        self.run_button = ttk.Button(button_frame, text="最適化実行", 
-                                     command=self.run_optimization, width=20)
-        self.run_button.grid(row=0, column=0, padx=5)
-        
-        self.stop_button = ttk.Button(button_frame, text="停止", 
-                                      command=self.stop_optimization, 
-                                      width=20, state=tk.DISABLED)
-        self.stop_button.grid(row=0, column=1, padx=5)
-        
-        row += 1
-        
-        # プログレスバー
-        self.progress = ttk.Progressbar(main_frame, mode='indeterminate')
-        self.progress.grid(row=row, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10)
-        row += 1
-        
+
         # ログ表示
         ttk.Label(main_frame, text="実行ログ", font=("", 12, "bold")).grid(
             row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 5))
         row += 1
-        
+
         self.log_text = scrolledtext.ScrolledText(main_frame, height=20, width=80)
         self.log_text.grid(row=row, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S))
+
         main_frame.rowconfigure(row, weight=1)
+        row += 1
+
+        # 実行・停止ボタン
+        ttk.Separator(main_frame, orient=tk.HORIZONTAL).grid(
+            row=row, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10)
+        row += 1
+        button_frame = ttk.Frame(main_frame)
+        button_frame.grid(row=row, column=0, columnspan=3)
+        self.run_button = ttk.Button(button_frame, text="最適化実行", command=self.run_optimization, width=20)
+        self.run_button.grid(row=0, column=0, padx=5)
+        self.stop_button = ttk.Button(button_frame, text="停止", command=self.stop_optimization, width=20, state=tk.DISABLED)
+        self.stop_button.grid(row=0, column=1, padx=5)
+        row += 1
+
+        # プログレスバー
+        self.progress = ttk.Progressbar(main_frame, mode='indeterminate')
+        self.progress.grid(row=row, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10)
+        row += 1
+
+        # ログにリダイレクト
+        sys.stdout = TextRedirector(self.log_text)
+        sys.stderr = TextRedirector(self.log_text)
+
+        # archモード初期表示を反映
+        self.update_arch_mode()
+
+    def update_arch_mode(self):
+        if self.arch_mode.get() == "partial":
+            self.arch_side_frame.grid()
+        else:
+            self.arch_side_frame.grid_remove()
         
         # ログにリダイレクト
         sys.stdout = TextRedirector(self.log_text)
@@ -245,6 +262,9 @@ class OcclusionOptimizerGUI:
                 "--lower", self.lower_stl_path.get(),
                 "--move", self.move_mode.get()
             ]
+            # 片顎モードの場合は追加引数
+            if self.arch_mode.get() == "partial":
+                cmd += ["--partial-arch", "--arch-side", self.arch_side.get()]
             
             print(f"\n実行コマンド: {' '.join(cmd)}\n")
             
