@@ -891,8 +891,8 @@ class SpringOcclusionScorer:
             return float(self.gpu_bias_a * tz + self.gpu_bias_b)
         else:
             return self.gpu_bias
-
-    def fit_gpu_bias(self, tz_list, bias_list, near_th=0.05, min_points=8):
+    
+    def fit_gpu_bias(self, tz_list, bias_list, near_th=0.15, min_points=6):
         """
         GPU/CPUバイアス推定: 複数点＋外れ値耐性の2段階線形フィット
         - tz_list: tz値のリスト
@@ -2307,7 +2307,7 @@ def main():
         tx, rx, ry = 0.0, 0.0, 0.0
         # CPU診断
         gap_info = scorer.region_gap_info(tx, rx, ry, tz)
-        cpu_min = min([info["min_raw"] for info in gap_info.values()])
+        cpu_min = min([info["min"] for info in gap_info.values()])
 
         # GPU評価
         score, info = scorer.evaluate(tx, rx, ry, tz)
