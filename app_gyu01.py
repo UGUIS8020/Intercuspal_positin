@@ -1,66 +1,28 @@
+
+
 import os
 import sys
 import argparse
+
+# --- Diagnostic logging flag (set in main) ---
+DIAG = False
 import numpy as np
 import trimesh
 from tkinter import Tk, filedialog
 from scipy.spatial.transform import Rotation as R
 
+from utils import load_mesh_safely
+
+
 # GPU加速の設定
 try:
     import cupy as cp
     GPU_AVAILABLE = True
-    print("✓ CuPy GPU加速が利用可能です")
+    print("[OK] CuPy GPU加速が利用可能です")
 except ImportError:
-    print("⚠ CuPy が見つかりません。CPU版で動作します。")
+    print("[WARN] CuPy not found. Running in CPU mode.")
     import numpy as cp  # fallback to numpy
     GPU_AVAILABLE = False
-
-# NOTE:
-# 距離計算は gpu_min_distances() を使用する（追加依存: cuVS/pylibraft が必要になる実装は避ける）
-
-def repair_mesh(mesh: trimesh.Trimesh, name: str, *, aggressive: bool = False) -> trimesh.Trimesh:
-    """
-    可能な範囲でメッシュを安定化（非水密の影響を減らす）
-    aggressive=True で少し強めに修復する
-    
-    Returns
-    -------
-    trimesh.Trimesh
-        修復されたメッシュ
-    """
-    import copy
-    mesh = copy.deepcopy(mesh)
-    
-    # 基本クリーニング（trimesh標準API）
-    # 重複頂点をマージ
-    mesh.merge_vertices()
-    
-    # 退化した面を削除
-    mesh.update_faces(mesh.nondegenerate_faces())
-    
-    # 未使用頂点を削除
-    mesh.remove_unreferenced_vertices()
-    
-    # 法線を修正
-    mesh.fix_normals()
-    
-    # 可能なら穴埋め（成功しない形状もあります）
-    try:
-        trimesh.repair.fill_holes(mesh)
-    except Exception:
-        pass
-    
-    # 非多様体等の軽微な揺れ対策（重いので必要時だけ）
-    if aggressive:
-        try:
-            trimesh.repair.fix_winding(mesh)
-            trimesh.repair.fix_inversion(mesh)
-        except Exception:
-            pass
-    
-    print(f"[MESH] {name}: watertight={mesh.is_watertight}, euler={mesh.euler_number}")
-    return mesh
 
 def array_to_gpu(arr):
     """numpy array をGPUに転送"""
@@ -79,105 +41,6 @@ def array_to_cpu(arr):
 # 深噛み検出のロバスト化
 # =============================
 
-def compute_deep_metrics(distances, k_ratio=0.005, k_min=6):
-    """
-    距離配列から複数のロバストな指標を計算する。
-    
-    Parameters
-    ----------
-    distances : np.ndarray
-        距離配列
-    k_ratio : float
-        下位点選択の割合（デフォルト0.5%）
-    k_min : int
-        最小選択点数（デフォルト6点）
-    
-    Returns
-    -------
-    dict
-        min_abs: 絶対最小値（参考用）
-        min_p1: 下位1%点
-        deep_guard: 下位k点の中央値（ロバストな深噛み判定値）
-        k: 実際に使用した下位点数
-    
-    Notes
-    -----
-    - （追加依存を避けた距離計算：gpu_min_distances）
-    """
-    n = len(distances)
-    k = max(k_min, int(n * k_ratio))
-    k = min(k, n)  # 配列サイズを超えないように
-    
-    # 下位k点を取得（O(n)）
-    lower_k = np.partition(distances, k-1)[:k]
-    
-    return {
-        'min_abs': float(np.min(distances)),
-        'min_p1': float(np.percentile(distances, 1.0)),
-        'deep_guard': float(np.median(lower_k)),
-        'k': k
-    }
-
-
-def gpu_min_distances(points_a, points_b, batch_a=256, block_b=8192):
-    """
-    GPU加速版の最小距離計算（点群AからBへの最短距離）
-    
-    Parameters
-    ----------
-    points_a : cp.ndarray or np.ndarray
-        形状 (N, 3) のクエリ点群
-    points_b : cp.ndarray or np.ndarray
-        形状 (M, 3) のターゲット点群
-    batch_a : int
-        Aのバッチサイズ
-    block_b : int
-        Bのブロックサイズ
-    
-    Returns
-    -------
-    cp.ndarray
-        各点の最小距離 (N,)
-    
-    Notes
-    -----
-    - 追加依存（cuVS/pylibraft）を避けた GPU 距離最小化（gpu_min_distances）
-    - メモリ効率的なバッチ処理実装
-    """
-    if not GPU_AVAILABLE:
-        # CPU fallback
-        from scipy.spatial.distance import cdist
-        dists = cdist(points_a, points_b, metric='euclidean')
-        return np.min(dists, axis=1)
-    
-    points_a_gpu = array_to_gpu(points_a)
-    points_b_gpu = array_to_gpu(points_b)
-    
-    n_a = points_a_gpu.shape[0]
-    n_b = points_b_gpu.shape[0]
-    
-    min_dists = cp.full(n_a, cp.inf, dtype=cp.float32)
-    
-    for i_a in range(0, n_a, batch_a):
-        end_a = min(i_a + batch_a, n_a)
-        batch_points = points_a_gpu[i_a:end_a]
-        
-        batch_min = cp.full(end_a - i_a, cp.inf, dtype=cp.float32)
-        
-        for j_b in range(0, n_b, block_b):
-            end_b = min(j_b + block_b, n_b)
-            block_points = points_b_gpu[j_b:end_b]
-            
-            # ユークリッド距離計算: ||a - b||
-            diff = batch_points[:, cp.newaxis, :] - block_points[cp.newaxis, :, :]
-            dists = cp.sqrt(cp.sum(diff ** 2, axis=2))
-            
-            block_min = cp.min(dists, axis=1)
-            batch_min = cp.minimum(batch_min, block_min)
-        
-        min_dists[i_a:end_a] = batch_min
-    
-    return min_dists
 
 
 # =============================
@@ -193,21 +56,21 @@ def select_moving_jaw():
     
     # ダイアログで選択
     result = messagebox.askyesnocancel(
-        "顎の選択",
-        "どちらの顎を動かしますか？\n\n「はい」= 下顎を動かす（上顎固定）\n「いいえ」= 上顎を動かす（下顎固定）",
+        "Jaw Selection",
+        "Which jaw do you want to move?\n\nYes = Move lower jaw (upper fixed)\nNo = Move upper jaw (lower fixed)",
         icon='question'
     )
     
     root.destroy()
     
-    if result is None:  # キャンセル
-        print("❌ キャンセルされました")
+    if result is None:  # Cancel
+        print("[INFO] Operation cancelled.")
         sys.exit(0)
-    elif result:  # はい
-        print("✓ 選択: 下顎を動かす（上顎固定）")
+    elif result:  # Yes
+        print("[MODE] Selected: Move lower jaw (upper fixed)")
         return "lower"
-    else:  # いいえ
-        print("✓ 選択: 上顎を動かす（下顎固定）")
+    else:  # No
+        print("[MODE] Selected: Move upper jaw (lower fixed)")
         return "upper"
 
 def select_two_stl_files():
@@ -221,43 +84,43 @@ def select_two_stl_files():
     root.attributes('-topmost', True)  # ★ Windows対策: 最前面表示
     root.update()
     
-    print("\n=== STLファイル選択 ===")
+    print("\n=== STL File Selection ===")
     
     # 上顎選択（再試行ループ）
     upper_path = None
-    for attempt in range(3):  # 最大3回試行
-        print(f"\nまず上顎のSTLファイルを選択してください... (試行 {attempt+1}/3)")
+    for attempt in range(3):  # Up to 3 attempts
+        print(f"\nPlease select the upper jaw STL file... (Attempt {attempt+1}/3)")
         upper_path = filedialog.askopenfilename(
-            title="🦷 上顎（Upper Jaw）のSTLファイルを選択 - STEP 1/2",
+            title="上顎（Upper Jaw）のSTLファイルを選択 - STEP 1/2",
             filetypes=[("STL files", "*.stl"), ("All files", "*.*")],
             parent=root
         )
         if upper_path:
             break
-        print("⚠️  ファイルが選択されませんでした。もう一度お試しください。")
+        print("[WARN] No file selected. Please try again.")
     
     if not upper_path:
-        print("❌ エラー: 上顎 STL が選択されませんでした（3回試行）。")
+        print("[ERR] Upper jaw STL not selected after 3 attempts.")
         root.destroy()
         sys.exit(1)
     
-    print(f"✓ 上顎選択完了: {os.path.basename(upper_path)}")
+    print(f"[OK] Upper jaw selected: {os.path.basename(upper_path)}")
     
     # 下顎選択（再試行ループ）
     lower_path = None
-    for attempt in range(3):  # 最大3回試行
-        print(f"\n次に下顎のSTLファイルを選択してください... (試行 {attempt+1}/3)")
+    for attempt in range(3):  # Up to 3 attempts
+        print(f"\nPlease select the lower jaw STL file... (Attempt {attempt+1}/3)")
         lower_path = filedialog.askopenfilename(
-            title="🦷 下顎（Lower Jaw）のSTLファイルを選択 - STEP 2/2",
+            title="下顎（Lower Jaw）のSTLファイルを選択 - STEP 2/2",
             filetypes=[("STL files", "*.stl"), ("All files", "*.*")],
             parent=root
         )
         if lower_path:
             break
-        print("⚠️  ファイルが選択されませんでした。もう一度お試しください。")
+        print("[WARN] No file selected. Please try again.")
     
     if not lower_path:
-        print("❌ エラー: 下顎 STL が選択されませんでした（3回試行）。")
+        print("[ERR] Lower jaw STL not selected after 3 attempts.")
         root.destroy()
         sys.exit(1)
 
@@ -265,80 +128,16 @@ def select_two_stl_files():
     root.destroy()
 
     if os.path.abspath(upper_path) == os.path.abspath(lower_path):
-        print("❌ エラー: 同じ STL が2回選択されています。上顎と下顎は別ファイルを選んでください。")
+        print("[ERR] The same STL file was selected twice. Please select different files for upper and lower jaws.")
         sys.exit(1)
 
-    print(f"✓ 下顎選択完了: {os.path.basename(lower_path)}")
-    print(f"\n📁 選択されたファイル:")
-    print(f"   上顎: {upper_path}")
-    print(f"   下顎: {lower_path}")
+    print(f"[OK] Lower jaw selected: {os.path.basename(lower_path)}")
+    print(f"\n[INFO] Selected files:")
+    print(f"   Upper jaw: {upper_path}")
+    print(f"   Lower jaw: {lower_path}")
     print("=" * 50)
     return upper_path, lower_path
 
-def load_mesh_safely(filepath, allow_non_watertight=True):
-    """trimesh で STL を読み込む（自動修復 + 水密チェック）"""
-    try:
-        mesh = trimesh.load(filepath)
-        
-        if len(mesh.vertices) < 100:
-            raise ValueError(f"頂点数が少なすぎます: {len(mesh.vertices)}")
-        
-        # 初期状態チェック
-        is_watertight_before = mesh.is_watertight
-        
-        if not is_watertight_before:
-            print(f"\n⚠️  {os.path.basename(filepath)} が非水密です。自動修復を試行中...")
-            # 自動修復実行（aggressiveモードで強力に修復）
-            mesh = repair_mesh(mesh, os.path.basename(filepath), aggressive=True)
-        
-        # 修復後の水密チェック
-        is_watertight = mesh.is_watertight
-        
-        if not is_watertight:
-            # 修復に失敗した場合
-            if allow_non_watertight:
-                # 非水密でも続行を許可
-                print(f"\n{'='*70}")
-                print(f"⚠️  警告: {os.path.basename(filepath)} は非水密のまま続行します")
-                print(f"{'='*70}")
-                print(f"  ⚠️  結果の精度・再現性が低下する可能性があります")
-                print(f"  📌 より正確な結果が必要な場合は、MeshLabで修復してください")
-                print(f"{'='*70}\n")
-            else:
-                # 処理を中止
-                print(f"\n{'='*70}")
-                print(f"❌ エラー: {os.path.basename(filepath)} の自動修復に失敗しました")
-                print(f"{'='*70}")
-                print(f"\n【原因】")
-                print(f"  • STLに修復不可能な構造的欠陥があります")
-                print(f"  • 穴が大きすぎる、非多様体エッジが複雑など")
-                print(f"\n【影響】")
-                print(f"  • GPU vs CPU距離バイアスが0.09~0.11mm級に拡大")
-                print(f"  • 接触閾値0.035mmの精度が完全に破綻")
-                print(f"  • 最適化結果の再現性がなくなります")
-                print(f"\n【必須対応】MeshLabで手動修復してください:")
-                print(f"  1. MeshLabでSTLを開く")
-                print(f"  2. Filters → Cleaning and Repairing → Fill Holes")
-                print(f"  3. Filters → Cleaning and Repairing → Remove Non-Manifold Edges")
-                print(f"  4. Filters → Cleaning and Repairing → Remove Duplicate Faces")
-                print(f"  5. Filters → Cleaning and Repairing → Remove Zero Area Faces")
-                print(f"  6. File → Export Mesh As... で保存")
-                print(f"  7. 再度このプログラムを実行")
-                print(f"\n非水密STLでは信頼できる結果が得られないため、処理を中止します。")
-                print(f"\n💡 テスト目的で続行したい場合: --allow-non-watertight オプションを使用")
-                print(f"{'='*70}\n")
-                sys.exit(1)
-        
-        if is_watertight_before:
-            print(f"✓ {os.path.basename(filepath)} 読み込み ({len(mesh.vertices)} 頂点, 水密)")
-        else:
-            print(f"✓ {os.path.basename(filepath)} 自動修復成功 ({len(mesh.vertices)} 頂点, 水密)")
-        
-        return mesh
-    except Exception as e:
-        print(f"エラー: {filepath} の読み込みに失敗しました")
-        print("詳細:", e)
-        sys.exit(1)
 
 
 def per_vertex_area(mesh: trimesh.Trimesh):
@@ -355,133 +154,27 @@ def per_vertex_area(mesh: trimesh.Trimesh):
     return areas
 
 
-def export_contact_points_ply(
-    contact_points,
-    region_labels,
-    output_path,
-    region_colors=None
-):
-    """
-    接触点をPLY形式で出力（5ブロック別に色分け）
-    
-    Parameters
-    ----------
-    contact_points : np.ndarray (N, 3)
-        接触点座標
-    region_labels : list of str
-        各点の所属ブロック名 ["M_L", "M_R", ...]
-    output_path : str
-        出力先PLYファイルパス
-    region_colors : dict, optional
-        ブロック名 → RGB色（0-255）のマッピング
-    """
-    if region_colors is None:
-        region_colors = {
-            "M_L": (255, 100, 100),    # 赤系（左大臼歯）
-            "M_R": (100, 100, 255),    # 青系（右大臼歯）
-            "PM_L": (255, 200, 100),   # オレンジ系（左小臼歯）
-            "PM_R": (100, 200, 255),   # 水色系（右小臼歯）
-            "ANT": (100, 255, 100),    # 緑系（前歯）
-        }
-    
-    with open(output_path, 'w') as f:
-        # PLYヘッダー
-        f.write("ply\n")
-        f.write("format ascii 1.0\n")
-        f.write(f"element vertex {len(contact_points)}\n")
-        f.write("property float x\n")
-        f.write("property float y\n")
-        f.write("property float z\n")
-        f.write("property uchar red\n")
-        f.write("property uchar green\n")
-        f.write("property uchar blue\n")
-        f.write("end_header\n")
-        
-        # 頂点データ
-        for point, label in zip(contact_points, region_labels):
-            color = region_colors.get(label, (128, 128, 128))
-            f.write(f"{point[0]:.6f} {point[1]:.6f} {point[2]:.6f} "
-                   f"{color[0]} {color[1]} {color[2]}\n")
-    
-    print(f"✓ 接触点PLY出力: {output_path} ({len(contact_points)}点)")
 
 
 # =============================
 # 変換行列構築（評価と出力で完全一致させるため）
 # =============================
 
-def build_transform_matrix(tx, ty, rx_rad, ry_rad, tz, pivot=None):
-    """
-    剛体変換行列を構築（4×4のホモジニアス変換）
-    
-    変換順序: T(pivot) @ R @ T(-pivot) @ T(translation)
-    - pivot周りで回転
-    - その後、平行移動
-    
-    Args:
-        tx, ty, tz: 平行移動 (mm)
-        rx_rad, ry_rad: 回転角（ラジアン、X軸・Y軸）
-        pivot: 回転中心 (3,) array、Noneなら原点
-    
-    Returns:
-        4×4 numpy array（ホモジニアス変換行列）
-    """
-    from scipy.spatial.transform import Rotation as R
-    
-    # 回転行列（3×3）
-    rot_matrix = R.from_euler("xyz", [rx_rad, ry_rad, 0.0]).as_matrix()
-    
-    # 平行移動ベクトル
-    translation = np.array([tx, ty, tz])
-    
-    if pivot is None:
-        pivot = np.zeros(3)
-    
-    # 4×4 ホモジニアス行列の構築
-    # T(translation) @ T(pivot) @ R @ T(-pivot)
-    T_neg_pivot = np.eye(4)
-    T_neg_pivot[:3, 3] = -pivot
-    
-    R_mat = np.eye(4)
-    R_mat[:3, :3] = rot_matrix
-    
-    T_pivot = np.eye(4)
-    T_pivot[:3, 3] = pivot
-    
-    T_trans = np.eye(4)
-    T_trans[:3, 3] = translation
-    
-    # 順番: T(translation) @ T(pivot) @ R @ T(-pivot)
-    A = T_trans @ T_pivot @ R_mat @ T_neg_pivot
-    
-    return A
-
-
-def apply_transform_to_points(points, transform_matrix):
-    """
-    4×4変換行列を点群に適用
-    
-    Args:
-        points: (N, 3) numpy array
-        transform_matrix: (4, 4) numpy array
-    
-    Returns:
-        transformed_points: (N, 3) numpy array
-    """
-    # ホモジニアス座標に変換 (N, 4)
-    N = points.shape[0]
-    points_homogeneous = np.hstack([points, np.ones((N, 1))])
-    
-    # 変換適用
-    transformed_homogeneous = (transform_matrix @ points_homogeneous.T).T
-    
-    # 3D座標に戻す
-    return transformed_homogeneous[:, :3]
 
 
 # =============================
 # スコアリング（5本の輪ゴムスプリングモデル）
 # =============================
+
+
+def warn_watertight(is_watertight, filename=None):
+    if is_watertight:
+        return
+    msg = f"[WARN] Non-watertight STL detected: Deep bite threshold relaxed (measurement error considered)"
+    if filename:
+        msg = f"[WARN] {filename} is NOT watertight. Deep bite threshold relaxed."
+    print(msg)
+
 
 class SpringOcclusionScorer:
     """
@@ -497,37 +190,48 @@ class SpringOcclusionScorer:
 
     def __init__(
         self,
-        upper_mesh: trimesh.Trimesh,
-        lower_sample_vertices: np.ndarray,
-        lower_sample_areas: np.ndarray,
+        upper_mesh: 'trimesh.Trimesh',
+        lower_sample_vertices: 'np.ndarray',
+        lower_sample_areas: 'np.ndarray',
         contact_threshold: float = 0.03,
         rot_penalty: float = 1.5,
         trans_penalty: float = 2.0,
         moving_jaw: str = "lower",  # "lower" or "upper"
-        lower_mesh_for_springs: trimesh.Trimesh = None,  # スプリング配置用（常に下顎）
-        pivot: np.ndarray = None,  # 回転中心（重要：evaluate()と出力を一致させる）
+        lower_mesh_for_springs: 'trimesh.Trimesh' = None,  # スプリング配置用（常に下顎）
+        pivot: 'np.ndarray' = None,  # 回転中心（重要：evaluate()と出力を一致させる）
+        # Removed unused arguments: partial_arch, arch_side
+        upper_sample_count: int = 100000,
     ):
+        # region_masks_gpuを必ず初期化
+        self.region_masks_gpu = {}
+
+        self.upper_sample_count = upper_sample_count
+
+        # region_masks生成後にregion_masks_gpuも同じキーで空配列で初期化（必要に応じて上書きされる想定）
+        # region_masksが生成されるのはこの後なので、初期化はregion_masks生成直後に行う
         # 動かす顎を設定（内部的には固定側=upper、動かす側=v0）
         self.moving_jaw = moving_jaw
         self.upper = upper_mesh  # 固定側（上顎または下顎）
         self.v0 = lower_sample_vertices  # 動かす側のサンプル（下顎または上顎）
         self.areas = lower_sample_areas
         
+
         # 回転中心の設定（evaluate()とSTL出力で同じ変換を使うため）
         self.pivot = np.array(pivot, dtype=np.float32) if pivot is not None else np.zeros(3, dtype=np.float32)
-        
+
         if moving_jaw == "lower":
-            print(f"🦷 動作モード: 上顎固定 / 下顎を移動")
+            print("[INFO] Mode: Upper jaw fixed / Lower jaw moves")
         else:
-            print(f"🦷 動作モード: 下顎固定 / 上顎を移動")
-        
-        print(f"🎯 回転中心（pivot）: [{self.pivot[0]:.3f}, {self.pivot[1]:.3f}, {self.pivot[2]:.3f}]")
-        
+            print("[INFO] Mode: Lower jaw fixed / Upper jaw moves")
+
         # ★ メッシュ水密情報を保存（深噛み閾値調整に使用）
         self.mesh_is_watertight = upper_mesh.is_watertight
-        if not self.mesh_is_watertight:
-            print(f"  ⚠️  非水密STL検知: 深噛み閾値を緩和（測定誤差考慮）")
-            print(f"      critical: 0.005mm → 0.010mm, warning: 0.010mm → 0.015mm, caution: 0.015mm → 0.020mm")
+        warn_watertight(self.mesh_is_watertight)
+
+        # ほぼ死んでるバネを dead 扱いする閾値
+        # まずはこのくらいから開始（後でログ見て調整）
+        self.dead_eps_search = 0.015  # 探索時は少し緩め
+        self.dead_eps_final  = 0.020  # 確定時は少し厳しめ
             
         self.contact_threshold = contact_threshold
         # ★前歯の接触判定を厳しくする（後方支持を優先）
@@ -542,8 +246,25 @@ class SpringOcclusionScorer:
             self.areas_gpu = array_to_gpu(self.areas.astype(np.float32))
             
             # 上顎は表面サンプル点を使用（頂点ではなく面への最近接に近づける）
-            n_upper_samples = 80000  # サンプル数（調整可能）
-            upper_surface_points, _ = trimesh.sample.sample_surface(upper_mesh, n_upper_samples)
+
+            # サンプリング数は upper_sample_count から取得（UI/CLIで指定）
+            n_upper_samples = self.upper_sample_count
+            print(f"[INFO] Upper jaw surface sampling count: {n_upper_samples}")
+            
+            # ★★★ 再現性のためランダムシード固定 ★★★
+            np.random.seed(42)
+            print(f"[INFO] Random seed fixed to 42 for reproducibility")
+            
+            # 1) なるべく均一にサンプリング（偏りを減らす）
+            upper_surface_points, _ = trimesh.sample.sample_surface_even(
+                upper_mesh, n_upper_samples
+            )
+            # 2) sample_surface_even は点数が不足することがあるので補充して固定数にする
+            if len(upper_surface_points) < n_upper_samples:
+                need = n_upper_samples - len(upper_surface_points)
+                np.random.seed(42)  # 補充時も同じシード
+                extra_points, _ = trimesh.sample.sample_surface(upper_mesh, need)
+                upper_surface_points = np.vstack([upper_surface_points, extra_points])
             self.upper_vertices_gpu = array_to_gpu(upper_surface_points.astype(np.float32))
             
             self.pivot_gpu = array_to_gpu(self.pivot)
@@ -554,14 +275,14 @@ class SpringOcclusionScorer:
                 self.upper_vertices_gpu.nbytes
             ) / (1024 * 1024)
             
-            print(f"✓ GPU メモリに転送完了: {len(self.v0)} 下顎頂点, {n_upper_samples} 上顎表面サンプル点")
-            print(f"✓ GPU メモリ使用量: {gpu_memory_mb:.1f} MB")
-            print(f"✓ 改善: GPU距離は上顎【表面サンプル点】への最近接（CPU三角形面への最近接に近似）")
+            print(f"[INFO] GPU memory transfer complete: {len(self.v0)} lower jaw vertices, {n_upper_samples} upper jaw surface samples")
+            print(f"[INFO] GPU memory usage: {gpu_memory_mb:.1f} MB")
+            print(f"[INFO] Improvement: GPU distance is nearest to upper jaw surface samples (approximates CPU nearest to triangle faces)")
             
             # メモリ使用量チェック
             if hasattr(cp, 'get_default_memory_pool'):
                 mempool = cp.get_default_memory_pool()
-                print(f"✓ GPU メモリプール: {mempool.used_bytes()/(1024*1024):.1f} MB 使用中")
+                print(f"[INFO] GPU memory pool: {mempool.used_bytes()/(1024*1024):.1f} MB in use")
         else:
             self.v0_gpu = self.v0
             self.areas_gpu = self.areas
@@ -590,11 +311,11 @@ class SpringOcclusionScorer:
         if lower_mesh_for_springs is not None:
             # 上顎を動かす場合：下顎メッシュから境界値（x_mid, y_cut）を計算
             ref_vertices = lower_mesh_for_springs.vertices
-            print(f"🎯 スプリング配置: 下顎基準（下顎の座標系で領域境界を定義）")
+            print("[INFO] Spring placement: lower jaw reference (region boundaries defined in lower jaw coordinates)")
         else:
             # 下顎を動かす場合：サンプル頂点から境界値を計算
             ref_vertices = self.v0
-            print(f"🎯 スプリング配置: 動かす側基準（サンプル頂点から定義）")
+            print("[INFO] Spring placement: moving side reference (defined from sample vertices)")
         
         # 参照メッシュから境界値を計算
         x_ref = ref_vertices[:, 0]
@@ -605,29 +326,22 @@ class SpringOcclusionScorer:
         if y_max == y_min:
             # 万一全て同じ値なら、全部「臼歯」として扱う
             y_cut1 = y_min - 0.1
-            y_cut2 = y_min + 0.1
         else:
             dy = y_max - y_min
-            y_cut1 = y_min + dy / 3.0        # 大臼歯 / 小臼歯の境
-            y_cut2 = y_min + dy * 2.0 / 3.0  # 小臼歯 / 前歯の境
-
-        # サンプル頂点（動かす側）に境界値を適用してマスク作成
+            y_cut1 = y_min + dy / 3.0
+            y_cut2 = y_min + dy * 2.0 / 3.0
         x = self.v0[:, 0]
         y = self.v0[:, 1]
-        
         is_left = x <= self.x_mid
         is_right = ~is_left
-
         band_molar = y <= y_cut1
         band_premolar = (y > y_cut1) & (y <= y_cut2)
         band_ant = y > y_cut2
-
         mask_M_L = is_left & band_molar
         mask_M_R = is_right & band_molar
         mask_PM_L = is_left & band_premolar
         mask_PM_R = is_right & band_premolar
-        mask_ANT = band_ant  # 前歯は左右まとめて一本のゴム
-
+        mask_ANT = band_ant
         self.region_masks = {
             "M_L": mask_M_L,
             "M_R": mask_M_R,
@@ -635,27 +349,24 @@ class SpringOcclusionScorer:
             "PM_R": mask_PM_R,
             "ANT": mask_ANT,
         }
-        
-        # GPU高速化：region maskをGPUに事前転送（毎回転送しない）
-        if GPU_AVAILABLE:
-            self.region_masks_gpu = {
-                name: cp.asarray(mask) for name, mask in self.region_masks.items()
-            }
-            print(f"✓ GPU: region masks事前転送完了（5ブロック）")
-
-        # 実際に頂点が存在するブロックだけを「有効バネ」とみなす
-        self.valid_regions = [
-            name for name, m in self.region_masks.items() if np.any(m)
-        ]
-
-        print("\n[ブロック分割（輪ゴム5本）]")
-        total_points = len(lower_sample_vertices)
-        for name in ["M_L", "M_R", "PM_L", "PM_R", "ANT"]:
-            cnt = int(self.region_masks[name].sum())
+        total_points = len(self.v0)
+        # region_masks_gpuも同じキーで空配列で初期化
+        # maskが空配列なら全要素Falseの配列に置き換え
+        self.region_masks_gpu = {}
+        for name, mask in self.region_masks.items():
+            if mask.shape[0] == 0:
+                mask_fixed = np.zeros(total_points, dtype=bool)
+            else:
+                mask_fixed = mask
+            self.region_masks_gpu[name] = cp.asarray(mask_fixed)
+        # regionごとに有効頂点があるものをvalid_regionsとする
+        self.valid_regions = [name for name, mask in self.region_masks.items() if np.any(mask)]
+        for name, mask in self.region_masks.items():
+            cnt = int(mask.sum())
             pct = cnt / total_points * 100 if total_points > 0 else 0.0
-            flag = "✓" if name in self.valid_regions else "（頂点なし）"
-            print(f"  {name:5s}: {cnt:4d} 点 ({pct:5.1f}%) {flag}")
-        print(f"  有効バネ本数: {len(self.valid_regions)}")
+            flag = "[OK]" if name in self.valid_regions else "(no vertices)"
+            print(f"  {name:5s}: {cnt:4d} pts ({pct:5.1f}%) {flag}")
+        print(f"  Number of valid springs: {len(self.valid_regions)}")
         
         # ★ 左右バランス診断
         M_L_cnt = int(self.region_masks["M_L"].sum())
@@ -665,17 +376,16 @@ class SpringOcclusionScorer:
         
         if M_L_cnt + M_R_cnt > 0:
             M_ratio = M_L_cnt / (M_L_cnt + M_R_cnt)
-            print(f"\n  📊 大臼歯（M）左右比: L={M_L_cnt} vs R={M_R_cnt} → L_ratio={M_ratio:.3f}")
-            if abs(M_ratio - 0.5) > 0.15:  # 15%以上偏り
-                bias_side = "左" if M_ratio > 0.5 else "右"
-                print(f"     ⚠️  大臼歯が{bias_side}に偏っています（分割境界の要確認）")
-        
+            print(f"\n  [INFO] Molar (M) left/right ratio: L={M_L_cnt} vs R={M_R_cnt} -> L_ratio={M_ratio:.3f}")
+            if abs(M_ratio - 0.5) > 0.15:
+                bias_side = "left" if M_ratio > 0.5 else "right"
+                print(f"     [WARN] Molar is biased to the {bias_side} (check division boundary)")
         if PM_L_cnt + PM_R_cnt > 0:
             PM_ratio = PM_L_cnt / (PM_L_cnt + PM_R_cnt)
-            print(f"  📊 小臼歯（PM）左右比: L={PM_L_cnt} vs R={PM_R_cnt} → L_ratio={PM_ratio:.3f}")
+            print(f"  [INFO] Premolar (PM) left/right ratio: L={PM_L_cnt} vs R={PM_R_cnt} -> L_ratio={PM_ratio:.3f}")
             if abs(PM_ratio - 0.5) > 0.15:
-                bias_side = "左" if PM_ratio > 0.5 else "右"
-                print(f"     ⚠️  小臼歯が{bias_side}に偏っています（分割境界の要確認）")
+                bias_side = "left" if PM_ratio > 0.5 else "right"
+                print(f"     [WARN] Premolar is biased to the {bias_side} (check division boundary)")
 
         eps = 1e-12
         self.region_cap = {}
@@ -693,21 +403,55 @@ class SpringOcclusionScorer:
     def gpu_bias_mm(self, tz: float) -> float:
         """
         tzに応じたGPUバイアスを計算
-        
-        Parameters
-        ----------
-        tz : float
-            上下方向の平移 (mm)
-        
-        Returns
-        -------
-        float
-            補正すべきGPUバイアス (mm)
+        近接点のみで線形フィットした場合の補正値を返す
         """
         if self.use_linear_bias_correction:
             return float(self.gpu_bias_a * tz + self.gpu_bias_b)
         else:
             return self.gpu_bias
+    
+    def fit_gpu_bias(self, tz_list, bias_list, near_th=0.15, min_points=6):
+        """
+        GPU/CPUバイアス推定: 複数点＋外れ値耐性の2段階線形フィット
+        - tz_list: tz値のリスト
+        - bias_list: 各tzでのバイアス値リスト (全点)
+        - near_th: 近接点の閾値 (mm)
+        - min_points: フィットに使う最小点数
+        """
+        tz_arr = np.array(tz_list)
+        bias_arr = np.array(bias_list)
+        # 近接点のみ抽出
+        mask_near = np.abs(bias_arr) < near_th
+        tz_fit = tz_arr[mask_near]
+        bias_fit = bias_arr[mask_near]
+        if tz_fit.size >= min_points:
+            try:
+                # 1st fit
+                a1, b1 = np.polyfit(tz_fit, bias_fit, 1)
+                pred1 = a1 * tz_fit + b1
+                res1 = np.abs(bias_fit - pred1)
+                # 外れ値除外（上位25%を除外）
+                keep = res1 <= np.percentile(res1, 75)
+                if keep.sum() >= max(4, min_points // 2):
+                    a, b = np.polyfit(tz_fit[keep], bias_fit[keep], 1)
+                    self.gpu_bias_a = float(a)
+                    self.gpu_bias_b = float(b)
+                    self.use_linear_bias_correction = True
+                    print(f"[INFO] GPU/CPUバイアス: 近接点{tz_fit.size}個→外れ値除外後{keep.sum()}個で線形フィット: bias(tz) = {self.gpu_bias_a:+.6f}*tz + {self.gpu_bias_b:+.4f}")
+                else:
+                    # 外れ値除外後に点数が足りなければ定数バイアス
+                    self.gpu_bias = float(np.median(bias_fit))
+                    self.use_linear_bias_correction = False
+                    print(f"[WARN] バイアス外れ値除外後に点数不足: 定数補正 {self.gpu_bias:+.4f}mm")
+            except Exception as e:
+                self.gpu_bias = float(np.median(bias_fit))
+                self.use_linear_bias_correction = False
+                print(f"[WARN] バイアス線形フィット失敗: 定数補正 {self.gpu_bias:+.4f}mm ({e})")
+        else:
+            # 近接点が少なければ定数バイアス
+            self.gpu_bias = float(np.median(bias_arr))
+            self.use_linear_bias_correction = False
+            print(f"[WARN] 近接点が少ないため定数バイアス補正: {self.gpu_bias:+.4f}mm (近接点 {tz_fit.size}個)")
 
     def __del__(self):
         """GPUメモリを適切にクリーンアップ"""
@@ -736,7 +480,7 @@ class SpringOcclusionScorer:
         upper_block = 8192  # 上顎ブロックサイズ（4096〜16384で調整可能）
         
         if not hasattr(self, '_gpu_mode_notified'):
-            print(f"🚀 GPU高速並列計算（メモリ最適化版）: 下顎バッチ={batch_size}, 上顎ブロック={upper_block}")
+            print(f"[INFO] GPU parallel computation (memory optimized): Lower jaw batch={batch_size}, Upper jaw block={upper_block}")
             self._gpu_mode_notified = True
         
         for i in range(0, n_lower, batch_size):
@@ -782,7 +526,7 @@ class SpringOcclusionScorer:
         infos = []
         
         if not hasattr(self, '_batch_mode_notified'):
-            print(f"⚡ GPU並列バッチ評価: {n_poses} 姿勢")
+            print(f"[INFO] GPU parallel batch evaluation: {n_poses} poses")
             self._batch_mode_notified = True
         
         # 高速バッチ処理
@@ -819,16 +563,25 @@ class SpringOcclusionScorer:
         out = {}
         for name, mask in self.region_masks.items():
             if not np.any(mask):
-                out[name] = {"min": float("inf"), "near_count": 0}
+                out[name] = {
+                    "min": float("inf"),
+                    "min_raw": float("inf"),
+                    "p01": float("inf"),
+                    "p10": float("inf"),
+                    "p25": float("inf"),
+                    "near_count": 0,
+                    "contact_potential": 0.0
+                }
                 continue
             d = distances[mask]
             out[name] = {
-            # 安定性向上: min → 1%点に変更
-            "min": float(np.partition(d, max(1, int(0.01 * d.size)))[max(1, int(0.01 * d.size))]) if d.size > 0 else 999.0,
-            "p10": float(np.percentile(d, 10)),
-            "p25": float(np.percentile(d, 25)),  # 四分位点追加で分布把握強化
-            "near_count": int(np.sum(d <= near_th)),
-            "contact_potential": float(np.sum(d <= self.contact_threshold))  # 接触ポテンシャル
+                "min": float(np.percentile(d, 1)) if d.size else float("inf"),  # 1%点
+                "min_raw": float(d.min()) if d.size else float("inf"),
+                "p01": float(np.percentile(d, 1)) if d.size else float("inf"),
+                "p10": float(np.percentile(d, 10)),
+                "p25": float(np.percentile(d, 25)),  # 四分位点追加で分布把握強化
+                "near_count": int(np.sum(d <= near_th)),
+                "contact_potential": float(np.sum(d <= self.contact_threshold))  # 接触ポテンシャル
             }
         return out
 
@@ -836,7 +589,7 @@ class SpringOcclusionScorer:
         """
         探索範囲内で接触可能性を判定し、絶対当たらないブロックを特定
         """
-        print("\n🔍 接触可能性診断（絶対当たらない歯の検出）:")
+        print("\n[INFO] Contact feasibility diagnosis (detection of teeth that never contact):")
         
         # 探索範囲の代表点でテスト
         tx_vals = np.linspace(tx_range[0], tx_range[1], 3)
@@ -867,9 +620,9 @@ class SpringOcclusionScorer:
                 print(f"  {name}: feasible (min={overall_min:.3f}mm, near={near_count_max})")
         
         if self.infeasible_regions:
-            print(f"✓ {len(self.infeasible_regions)}個のブロックを探索から除外: {list(self.infeasible_regions)}")
+            print(f"[INFO] {len(self.infeasible_regions)} blocks excluded from search: {list(self.infeasible_regions)}")
         else:
-            print("✓ 全ブロックが接触可能範囲内")
+            print("[INFO] All blocks are within contactable range")
 
     # ----------------------------
     # 姿勢評価
@@ -905,10 +658,10 @@ class SpringOcclusionScorer:
             # 🔍 距離分布診断（初回のみ表示）
             if not hasattr(self, '_dist_diagnosed'):
                 p_percentile = np.percentile(dist_raw, [0, 1, 5, 10, 50, 90, 95, 99, 100])
-                print(f"🔍 距離分布(mm): {p_percentile}")
-                print(f"   <=0.035mm: {np.mean(dist_raw <= 0.035):.3f}（{np.sum(dist_raw <= 0.035)}点）")
-                print(f"   <=0.050mm: {np.mean(dist_raw <= 0.050):.3f}（{np.sum(dist_raw <= 0.050)}点）")
-                print(f"   0.035-0.050mm帯: {np.sum((dist_raw > 0.035) & (dist_raw <= 0.050))}点（ニアミス領域）")
+                print(f"[INFO] Distance distribution (mm): {p_percentile}")
+                print(f"   <=0.035mm: {np.mean(dist_raw <= 0.035):.3f} ({np.sum(dist_raw <= 0.035)} points)")
+                print(f"   <=0.050mm: {np.mean(dist_raw <= 0.050):.3f} ({np.sum(dist_raw <= 0.050)} points)")
+                print(f"   0.035-0.050mm: {np.sum((dist_raw > 0.035) & (dist_raw <= 0.050))} points (near-miss region)")
                 self._dist_diagnosed = True
             
             # ✅ Step0修正: 接触判定は生距離で行う（クリップ前）
@@ -933,7 +686,7 @@ class SpringOcclusionScorer:
             d_gpu = np.clip(dist_raw, 0.0, max_dist_clip)    # ★クリップは重み計算用
             
             if force_cpu and not hasattr(self, '_cpu_final_notified'):
-                print("🎯 CPU最終評価: trimeshの三角形面最近接で確定計算")
+                print("[INFO] CPU strict evaluation: using trimesh triangle surface nearest calculation")
                 self._cpu_final_notified = True
         
         elif GPU_AVAILABLE:
@@ -982,13 +735,13 @@ class SpringOcclusionScorer:
 
             if not hasattr(self, '_gpu_calc_notified'):
                 if self.use_linear_bias_correction:
-                    print(f"🚀 GPU候補生成: 変換（pivot回り） + 距離計算 + バイアス動的補正")
+                    print(f"[INFO] GPU candidate generation: transform (pivot), distance calculation, dynamic bias correction")
                     print(f"   bias(tz) = {self.gpu_bias_a:+.6f}*tz + {self.gpu_bias_b:+.4f}")
                 else:
-                    print(f"🚀 GPU候補生成: 変換（pivot回り） + 距離計算 + バイアス補正({self.gpu_bias:+.3f}mm)")
+                    print(f"[INFO] GPU candidate generation: transform (pivot), distance calculation, bias correction ({self.gpu_bias:+.3f}mm)")
                 if hasattr(cp, 'get_default_memory_pool'):
                     mempool = cp.get_default_memory_pool()
-                    print(f"   GPU使用中: {mempool.used_bytes()/(1024*1024):.1f} MB")
+                    print(f"   GPU memory used: {mempool.used_bytes()/(1024*1024):.1f} MB")
                 self._gpu_calc_notified = True
 
         # --------------------------------------------------
@@ -1003,12 +756,11 @@ class SpringOcclusionScorer:
             contact_count_int = int(array_to_cpu(cp.sum(contact_mask_gpu)))
         
         # 🔥 GPU壊れ検出ガード: 全点接触は物理的に不可能（force_cpu=Trueの場合はスキップ）
-        if not force_cpu:  # force_cpu=True時はGPU異常検出をスキップして無限再帰を防ぐ
-            if contact_count_int >= len(self.v0) * 0.95:  # 95%以上が接触なら異常
+        if not force_cpu:
+            if contact_count_int >= len(self.v0) * 0.95:
                 if not hasattr(self, '_gpu_fallback_notified'):
-                    print(f"🔥 GPU異常検出: {contact_count_int}/{len(self.v0)}点が接触扱い → CPU緊急フォールバック")
+                    print(f"[ERR] GPU abnormality detected: {contact_count_int}/{len(self.v0)} points in contact -> CPU fallback")
                     self._gpu_fallback_notified = True
-                # CPU再評価で正しい結果を取得
                 return self.evaluate(tx, rx_rad, ry_rad, tz, max_dist_clip, force_cpu=True)
         
         if contact_count_int == 0:
@@ -1032,7 +784,7 @@ class SpringOcclusionScorer:
                 "spring_min": 0.0,
                 "spring_var": 0.0,
                 "spring_mean": 0.0,
-                "spring_zero": len(self.valid_regions),
+                "dead_springs": len(self.valid_regions),
                 "tx": tx,
                 "rx": rx_rad,
                 "ry": ry_rad,
@@ -1146,15 +898,22 @@ class SpringOcclusionScorer:
 
         # 5本の輪ゴムの状態（接触不可能ブロックは除外してカウント）
         if len(scores_arr) > 0:
-            min_region = float(scores_arr.min())
-            var_region = float(scores_arr.var())
-            mean_region = float(scores_arr.mean())
-            zero_regions = int(np.sum(scores_arr < 1e-6))  # feasibleブロック内での死んだバネ
+            # strengths: {region: strength}
+            strengths = {name: float(region_scores.get(name, 0.0)) for name in feasible_regions}
+            dead_eps = self.dead_eps_search if getattr(self, 'search_mode', False) else self.dead_eps_final
+            dead_regions = [name for name, s in strengths.items() if s < dead_eps]
+            min_region = min(strengths.values()) if strengths else 0.0
+            var_region = float(np.var(list(strengths.values()))) if strengths else 0.0
+            mean_region = float(np.mean(list(strengths.values()))) if strengths else 0.0
+            dead_springs = len(dead_regions)
         else:
+            strengths = {}
+            dead_regions = []
             min_region = 0.0
             var_region = 0.0
             mean_region = 0.0
-            zero_regions = len(feasible_regions)  # 全feasibleブロックが死亡
+            dead_eps = self.dead_eps_search if getattr(self, 'search_mode', False) else self.dead_eps_final
+            dead_springs = len(feasible_regions)  # 全feasibleブロックが死亡
 
         # 左右・前後の合計（ざっくり把握用）
         left_area = region_areas["M_L"] + region_areas["PM_L"]
@@ -1179,7 +938,7 @@ class SpringOcclusionScorer:
             0.4 * total_strength   # 全体として噛んでいるか（元の成功値）
             + 1.8 * min_region     # 一番弱いバネもちゃんと張っているか（元の成功値）
             - 0.3 * var_region     # 強いバネと弱いバネの差が大きいほど減点（元の成功値）
-            - 0.8 * zero_regions   # 完全にサボっているブロックがあると減点（元の成功値）
+            - 0.8 * dead_springs   # 完全にサボっているブロックがあると減点（元の成功値）
             + right_bonus          # 右側窩嵌合を促進
             - rot_pen
             - trans_pen
@@ -1199,7 +958,10 @@ class SpringOcclusionScorer:
             "spring_min": min_region,
             "spring_var": var_region,
             "spring_mean": mean_region,
-            "spring_zero": zero_regions,
+            "dead_springs": dead_springs,
+            "dead_eps": dead_eps,
+            "strengths": strengths,
+            "dead_regions": dead_regions,
             "tx": tx,
             "rx": rx_rad,
             "ry": ry_rad,
@@ -1267,47 +1029,6 @@ class SpringOcclusionScorer:
 # 探索アルゴリズム
 # =============================
 
-def update_gpu_bias_dynamic(scorer, tx=0.0, rx=0.0, ry=0.0, tz_samples=None):
-    """
-    GPU bias補正: 指定された姿勢(tx,rx,ry)でtzをスキャンし、biasを測定
-    
-    ⚠️  重要: bias測定は初期姿勢(tx=0, rx=0, ry=0)で固定し、全Phaseで再利用することを推奨。
-    姿勢ごとに再測定するとbiasが不安定になり、再現性が低下します。
-    
-    Args:
-        scorer: SpringOcclusionScorer インスタンス
-        tx, rx, ry: 測定姿勢パラメータ（デフォルトは初期姿勢）
-        tz_samples: tzのサンプル点リスト（Noneなら自動生成）
-    
-    Returns:
-        (bias_median, bias_std): 測定されたbiasの中央値と標準偏差
-    """
-    if not GPU_AVAILABLE:
-        return 0.0, 0.0
-    
-    if tz_samples is None:
-        tz_samples = [2.0, 1.0, 0.5, 0.0, -0.5]
-    
-    bias_list = []
-    for tz in tz_samples:
-        # CPU診断
-        gap_info = scorer.region_gap_info(tx, rx, ry, tz)
-        cpu_min = min([info["min"] for info in gap_info.values()])
-        
-        # GPU評価
-        score, info = scorer.evaluate(tx, rx, ry, tz)
-        gpu_min = info.get("min_dist_raw", 999.0)
-        
-        bias = gpu_min - cpu_min
-        bias_list.append(bias)
-    
-    bias_median = np.median(bias_list)
-    bias_std = np.std(bias_list)
-    
-    # scorer のbiasを更新
-    scorer.gpu_bias = bias_median
-    
-    return bias_median, bias_std
 
 def objective_from_info(score, info, scorer, w_lr=1.5, w_pml=0.9, pml_margin=0.10, w_mr=0.3):
     """
@@ -1435,7 +1156,7 @@ def objective_from_info(score, info, scorer, w_lr=1.5, w_pml=0.9, pml_margin=0.1
         "pm_l_share": pm_l_share,
         "ANT_share": ANT_share,
         "ANT_critical": ANT_share > ANT_critical,  # ★ 前歯過多フラグ（40%超）
-        "dead": info["spring_zero"],
+        "dead": info["dead_springs"],
         "total_strength": total_strength,
     }
     
@@ -1468,7 +1189,7 @@ def line_search_tz(scorer: SpringOcclusionScorer,
     best_info = None
 
     tz = tz_start
-    print("\n[Step1] tz 方向スキャンで初期位置を探索（objective で選択）")
+    print("\n[Step1] Scanning tz direction for initial position (selecting by objective)")
     i = 0
     while tz >= tz_end - 1e-9:
         obj, score, info, L_ratio, pm_l_share = objective(tx0, rx0, ry0, tz)
@@ -1497,13 +1218,13 @@ def line_search_tz(scorer: SpringOcclusionScorer,
         i += 1
 
     print(
-        f"\n  → 初期候補: tz={best_tz:.3f} mm, obj={best_obj:.3f}, score={best_score:.3f}, "
+        f"\n  [INFO] Initial candidate: tz={best_tz:.3f} mm, obj={best_obj:.3f}, score={best_score:.3f}, "
         f"area={best_info['total_area']:.4f}"
     )
     
     # 🎯 方式A'改善: Step1でGPU obj上位K個をCPU確定評価して最良を選ぶ
     # ※ Step1は候補数が少ない（13点程度）ので、上位K個をCPU評価しても時間増加は軽微
-    print(f"\n🎯 Step1: GPU obj上位候補をCPU確定評価（GPU→CPU激落ち対策）")
+    print(f"\n[INFO] Step1: Evaluating top GPU obj candidates with CPU (GPU->CPU fallback)")
     
     # GPU評価結果を全て収集
     tz = tz_start
@@ -1517,7 +1238,7 @@ def line_search_tz(scorer: SpringOcclusionScorer,
     K = min(5, len(gpu_results))  # 上位5個（候補数が少なければ全て）
     top_k = sorted(gpu_results, key=lambda x: x[0], reverse=True)[:K]
     
-    print(f"   GPU上位{K}候補をCPU strict評価中...")
+    print(f"   Evaluating top {K} GPU candidates with CPU strict mode...")
     
     # CPU strict評価して最良を選択
     best_cpu_obj = -1e18
@@ -1540,8 +1261,8 @@ def line_search_tz(scorer: SpringOcclusionScorer,
             best_cpu_score = cpu_score
             best_cpu_info = cpu_info
     
-    print(f"\n   ✓ Step1最良（CPU確定）: tz={best_cpu_tz:.3f}, obj={best_cpu_obj:.3f}, "
-          f"score={best_cpu_score:.3f}, area={best_cpu_info['total_area']:.4f}mm², contacts={best_cpu_info['num_contacts']}")
+        print(f"\n   [OK] Step1 best (CPU strict): tz={best_cpu_tz:.3f}, obj={best_cpu_obj:.3f}, "
+            f"score={best_cpu_score:.3f}, area={best_cpu_info['total_area']:.4f}mm^2, contacts={best_cpu_info['num_contacts']}")
     
     return best_cpu_tz, best_cpu_score, best_cpu_info
 
@@ -1580,7 +1301,7 @@ def hill_climb_4d(scorer: SpringOcclusionScorer,
     L_ratio = comp["L_ratio"]
     pm_l_share = comp["pm_l_share"]
     
-    print("\n[Step2] 近傍ヒルクライム開始（objective で最適化）")
+    print("\n[Step2] Starting neighborhood hill climb (optimizing by objective)")
     print(
         f"  start: tx={tx:.3f}mm, rx={np.rad2deg(rx):.3f}°, "
         f"ry={np.rad2deg(ry):.3f}°, tz={tz:.3f} mm, "
@@ -1590,7 +1311,7 @@ def hill_climb_4d(scorer: SpringOcclusionScorer,
     
     # デバッグ用：初期評価の詳細表示
     if force_cpu_eval:
-        print(f"  [DEBUG] 初期 obj={obj:.6f} (この値より大きい obj を探す)")
+        print(f"  [DEBUG] Initial obj={obj:.6f} (searching for larger obj)")
 
     rad_step = np.deg2rad(deg_step)
     max_rot_rad = np.deg2rad(max_rot_deg)
@@ -1700,14 +1421,13 @@ def hill_climb_4d(scorer: SpringOcclusionScorer,
         if not improved:
             # ★ 最低反復回数保証（it<2では継続探索、処理時間とのバランス）
             if it < 2:
-                print(f"  it={it}: 改善なし → 継続探索（最低反復2回未達、刻み幅を縮小）")
-                # 刻み幅を少し縮小して継続
+                print(f"  it={it}: No improvement -> Continue search (minimum 2 iterations not reached, reducing step size)")
                 tx_step *= 0.75
                 rad_step *= 0.75
                 tz_step *= 0.75
                 continue
             else:
-                print(f"  it={it}: 改善なし → 終了")
+                print(f"  it={it}: No improvement -> End")
                 break
 
         tx, rx, ry, tz = best_local
@@ -1729,7 +1449,7 @@ def hill_climb_4d(scorer: SpringOcclusionScorer,
 
     # ★ 修正：細かい刻みで最終リファイン（GPU評価→上位のみCPU確定）
     if force_cpu_eval and it < max_iter - 1:
-        print(f"\n  🔬 細かい刻みで最終リファイン（刻み: tx={tx_step/2:.3f}, deg={deg_step/2:.2f}°, tz={tz_step/2:.3f}）")
+        print(f"\n  [INFO] Final refinement with finer steps (tx={tx_step/2:.3f}, deg={deg_step/2:.2f}, tz={tz_step/2:.3f})")
         fine_tx_step = tx_step / 2
         fine_rad_step = rad_step / 2
         fine_tz_step = tz_step / 2
@@ -1762,13 +1482,13 @@ def hill_climb_4d(scorer: SpringOcclusionScorer,
                             candidates.append((obj_g, tx_c, rx_c, ry_c, tz_c))
             
             if not candidates:
-                print(f"    fine_it={fine_it}: 候補なし → 終了")
+                print(f"    fine_it={fine_it}: No candidates -> End")
                 break
             
             # 2) 上位TOP_K個だけCPU確定（厳密評価）
             candidates.sort(reverse=True, key=lambda x: x[0])
             TOP_K = 8  # 5〜10推奨
-            print(f"    fine_it={fine_it}: GPU評価で{len(candidates)}候補 → 上位{min(TOP_K, len(candidates))}個をCPU確定中...")
+            print(f"    fine_it={fine_it}: {len(candidates)} candidates by GPU -> Evaluating top {min(TOP_K, len(candidates))} with CPU...")
             
             improved_fine = False
             best_local_obj_fine = obj
@@ -1790,17 +1510,17 @@ def hill_climb_4d(scorer: SpringOcclusionScorer,
             if improved_fine:
                 tx, rx, ry, tz = best_local_fine
                 obj = best_local_obj_fine
-                print(f"    fine_it={fine_it}: obj={obj:.6f} (改善)")
+                print(f"    fine_it={fine_it}: obj={obj:.6f} (improved)")
             else:
-                print(f"    fine_it={fine_it}: 改善なし → 細かい探索終了")
+                print(f"    fine_it={fine_it}: No improvement -> End fine search")
                 break
 
     # 🎯 最終候補をCPUで確定評価（GPUバイアス問題を回避）
     if scorer.use_cpu_final_eval and GPU_AVAILABLE:
-        print(f"\n🎯 最終候補 (tx={tx:.3f}, tz={tz:.3f}) をCPUで確定評価中...")
+        print(f"\n[INFO] Final candidate (tx={tx:.3f}, tz={tz:.3f}) being strictly evaluated by CPU...")
         final_score, final_info = scorer.evaluate(tx, rx, ry, tz, force_cpu=True)
-        print(f"   GPU評価: score={score:.3f}, area={info['total_area']:.4f}mm²")
-        print(f"   CPU確定: score={final_score:.3f}, area={final_info['total_area']:.4f}mm²")
+        print(f"   [INFO] GPU evaluation: score={score:.3f}, area={info['total_area']:.4f}mm^2")
+        print(f"   [INFO] CPU final: score={final_score:.3f}, area={final_info['total_area']:.4f}mm^2")
         return tx, rx, ry, tz, final_score, final_info
     
     # 返す score/info は "純 score" のもの（従来互換）
@@ -1812,6 +1532,7 @@ def hill_climb_4d(scorer: SpringOcclusionScorer,
 # =============================
 
 def main():
+    global GPU_TRUSTED
     import time
     start_time = time.perf_counter()  # 処理開始時刻
     
@@ -1824,44 +1545,94 @@ def main():
   python app_gyu.py                  # ダイアログで選択
   python app_gyu.py --move lower     # 明示的に下顎を動かす（上顎固定）
   python app_gyu.py --move upper     # 明示的に上顎を動かす（下顎固定）
+  python app_gyu.py --partial-arch --arch-side right  # 片顎モード（右側）
         """
     )
+    # 削除: 不要な未完のparser.add_argument行（SyntaxError対策）
     parser.add_argument(
-        "--move",
-        choices=["lower", "upper"],
-        default=None,  # Noneにして、指定がなければダイアログで選択
-        help="動かす顎を選択 (指定なしの場合はダイアログで選択)"
+        '--upper',
+        type=str,
+        default=None,
+        help='上顎STLファイルのパス'
     )
     parser.add_argument(
-        "--allow-non-watertight",
-        action="store_true",
-        help="⚠️ 非水密STLでも続行する（結果の信頼性は保証されません）"
+        '--lower',
+        type=str,
+        default=None,
+        help='下顎STLファイルのパス'
+    )
+    parser.add_argument(
+        '--move',
+        choices=['lower', 'upper'],
+        default=None,
+        help='動かす顎（lower/upper）'
+    )
+    parser.add_argument(
+        '--partial-arch',
+        action='store_true',
+        help='片顎モードを有効化'
+    )
+    parser.add_argument(
+        '--arch-side',
+        choices=['left', 'right'],
+        default='right',
+        help='片顎の左右指定（デフォルト: right）'
+    )
+    parser.add_argument(
+        '--upper-sample-count',
+        type=int,
+        default=100000,
+        help='上顎サーフェスサンプリング数（デフォルト: 100000）'
+    )
+    parser.add_argument(
+        '--diag',
+        action='store_true',
+        help='診断ログを有効化（デバッグ用）'
     )
     args = parser.parse_args()
-    
+
+    global DIAG
+    DIAG = args.diag
+
     print("=" * 80)
     print("咬頭嵌合位自動最適化（5本の輪ゴムスプリングモデル）v4 - 診断強化版")
     print("=" * 80)
-    
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 片顎モードは未サポート（partial-archはapp_gyu_partial.pyで対応）
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if args.partial_arch:
+        print("[ERR] 片顎モード（partial-arch）はこのスクリプトではサポートされていません。app_gyu_partial.pyを使用してください。")
+        sys.exit(1)
+
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # 出力形式を決定（コマンドライン引数またはダイアログ）
-    # ★重要：最適化は常に「下顎移動モード」で実行（安定性・再現性が高い）
-    #        output_mode は「どちらのSTLを動かして出力するか」の選択
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # UIで動かす顎の選択ボタン（下顎/上顎）
     if args.move is None:
-        # コマンドライン引数がない場合はダイアログで選択
-        output_mode = select_moving_jaw()
+        output_mode = select_moving_jaw()  # ダイアログで顎選択
     else:
         output_mode = args.move
-        print(f"🦷 出力モード: {output_mode}（{'下顎' if output_mode == 'lower' else '上顎'}）を動かした結果を出力")
+        print(f"[MODE] 出力モード: {output_mode}（{'下顎' if output_mode == 'lower' else '上顎'}）を動かした結果を出力")
 
-    print(f"\n📌 最適化方式: 常に「下顎移動」で実行（安定性・再現性が最も高い）")
-    print(f"📌 出力形式: {'下顎を動かす（A適用）' if output_mode == 'lower' else '上顎を動かす（A⁻¹適用）'}")
-    print(f"   → 相対咬合は完全に同一、座標系だけ違う")
+    print(f"\n[INFO] 最適化方式: {'下顎移動' if output_mode == 'lower' else '上顎移動'}で実行（安定性・再現性が最も高い）")
+    print(f"[INFO] 出力形式: {'下顎を動かす(A適用)' if output_mode == 'lower' else '上顎を動かす(A-1適用)'}")
+    print(f"   -> 相対咬合は完全に同一、座標系だけ違う")
 
-    upper_path, lower_path = select_two_stl_files()
+    # STLファイル選択（コマンドライン引数またはダイアログ）
+    if args.upper and args.lower:
+        upper_path = args.upper
+        lower_path = args.lower
+        print(f"\n[INFO] STLファイル（コマンドライン引数から）:")
+        print(f"  上顎: {upper_path}")
+        print(f"  下顎: {lower_path}")
+    else:
+        upper_path, lower_path = select_two_stl_files()
+
     upper = load_mesh_safely(upper_path)
     lower = load_mesh_safely(lower_path)
+    warn_watertight(upper.is_watertight, os.path.basename(upper_path))
+    warn_watertight(lower.is_watertight, os.path.basename(lower_path))
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # 最適化は常に「下顎移動モード」で実行（固定）
@@ -1869,217 +1640,146 @@ def main():
     print("\n頂点面積を計算中...")
     sample_mesh = lower  # 常に下顎をサンプル（動かす側）
     fixed_mesh = upper   # 常に上顎を固定
-    print("📌 最適化用メッシュ設定: 下顎サンプル（移動）/ 上顎固定")
-    
+    print("[INFO] 最適化用メッシュ設定: 下顎サンプル（移動）/ 上顎固定")
+
     sample_vertex_area_all = per_vertex_area(sample_mesh)
     all_vertices = sample_mesh.vertices
     n_vertices = len(all_vertices)
     SAMPLE_SIZE = 1200  # 元の成功値（精度と速度のバランス）
 
+
     if n_vertices > SAMPLE_SIZE:
+        np.random.seed(42)  # ★ 再現性のためシード固定
         rng = np.random.default_rng(0)
         sample_idx = rng.choice(n_vertices, size=SAMPLE_SIZE, replace=False)
-        print(f"✓ {n_vertices} 頂点から {SAMPLE_SIZE} 頂点をサンプリング")
+        print(f"[INFO] Sampled {SAMPLE_SIZE} vertices from {n_vertices} total vertices (seed=42)")
     else:
         sample_idx = np.arange(n_vertices)
-        print(f"✓ 全 {n_vertices} 頂点を使用（{n_vertices} 頂点）")
+        print(f"[INFO] Using all {n_vertices} vertices")
 
     sample_vertices = all_vertices[sample_idx]
     sample_areas = sample_vertex_area_all[sample_idx]
 
-    # 回転中心：下顎メッシュ全体の重心（evaluate()とSTL出力で一致させる）
+    # Pivot: centroid of lower jaw mesh (consistent with evaluate() and STL output)
     pivot_lower = lower.vertices.mean(axis=0)
-    print(f"🎯 回転中心（pivot）設定: [{pivot_lower[0]:.3f}, {pivot_lower[1]:.3f}, {pivot_lower[2]:.3f}]")
+    print(f"[INFO] Pivot (rotation center) set: [{pivot_lower[0]:.3f}, {pivot_lower[1]:.3f}, {pivot_lower[2]:.3f}]")
 
-    # スコアラー準備
-    # 常に「上顎固定、下顎移動」で最適化
+    # SpringOcclusionScorerは常に「下顎移動」モードで1回だけ生成
     scorer = SpringOcclusionScorer(
-        upper_mesh=fixed_mesh,  # 上顎（固定側）
+        upper_mesh=fixed_mesh,               # 上顎固定
         lower_sample_vertices=sample_vertices,  # 下顎サンプル（動かす側）
         lower_sample_areas=sample_areas,
-        contact_threshold=0.035,  # 右側窩嵌合改善のため微増（0.035mm）
+        contact_threshold=0.035,
         rot_penalty=1.5,
         trans_penalty=2.0,
-        moving_jaw="lower",  # 最適化は常に下顎移動
-        lower_mesh_for_springs=None,  # 下顎移動なのでNone（サンプル頂点から定義）
-        pivot=pivot_lower,  # ★重要：evaluate()と出力で同じ変換を使う
+        moving_jaw="lower",                  # 最適化は常に下顎移動
+        lower_mesh_for_springs=None,
+        pivot=pivot_lower,
+        upper_sample_count=args.upper_sample_count
     )
 
     # まず、メッシュの大まかな位置関係を調査
-    print("\n[診断] メッシュ位置関係の調査")
-    upper_center = upper.vertices.mean(axis=0)
-    lower_center = lower.vertices.mean(axis=0)
-    print(f"上顎中心: {upper_center}")
-    print(f"下顎中心: {lower_center}")
-    print(f"初期ギャップ: {upper_center - lower_center}")
-    
-    # より広い範囲での距離調査（Step1範囲を自動決定するため）
-    test_positions = [
-        (0.0, 0.0, 0.0, 2.0),   # 大きく離れた位置
-        (0.0, 0.0, 0.0, 1.0),   # 中間位置  
-        (0.0, 0.0, 0.0, 0.0),   # 基準位置
-        (0.0, 0.0, 0.0, -1.0),  # 接近位置
-        (0.0, 0.0, 0.0, -2.0),  # さらに接近
-    ]
-    
-    print("\n[診断] 各位置での最短距離調査 (CPUの診断):")
-    tz_distance_map = {}
-    for tx, rx, ry, tz in test_positions:
-        gap_info = scorer.region_gap_info(tx, rx, ry, tz, near_th=0.5)  # 0.5mm以内
-        min_distances = [info["min"] for info in gap_info.values()]
-        overall_min = min(min_distances)
-        tz_distance_map[tz] = overall_min
-        print(f"  tz={tz:5.1f}mm: 最短距離={overall_min:.3f}mm")
-        if overall_min < 0.1:  # 0.1mm以内なら詳細表示
-            for region, info in gap_info.items():
-                if info["min"] < 0.1:
-                    print(f"    {region}: min={info['min']:.3f}mm, near_count={info['near_count']}")
-    
-    # ★ Step1のtzスキャン範囲を診断結果から自動決定
-    # 接触域（min_dist < 0.2mm）を含むようにする
-    tz_values = sorted(tz_distance_map.keys())
+
+    if DIAG:
+        print("\n[診断] メッシュ位置関係の調査")
+        upper_center = upper.vertices.mean(axis=0)
+        lower_center = lower.vertices.mean(axis=0)
+        print(f"上顎中心: {upper_center}")
+        print(f"下顎中心: {lower_center}")
+        print(f"初期ギャップ: {upper_center - lower_center}")
+
+        # より広い範囲での距離調査（Step1範囲を自動決定するため）
+        test_positions = [
+            (0.0, 0.0, 0.0, 2.0),   # 大きく離れた位置
+            (0.0, 0.0, 0.0, 1.0),   # 中間位置  
+            (0.0, 0.0, 0.0, 0.0),   # 基準位置
+            (0.0, 0.0, 0.0, -1.0),  # 接近位置
+            (0.0, 0.0, 0.0, -2.0),  # さらに接近
+        ]
+
+        print("\n[診断] 各位置での最短距離調査 (CPUの診断):")
+        tz_distance_map = {}
+        for tx, rx, ry, tz in test_positions:
+            gap_info = scorer.region_gap_info(tx, rx, ry, tz, near_th=0.5)  # 0.5mm以内
+            min_distances = [info["min"] for info in gap_info.values()]
+            overall_min = min(min_distances)
+            tz_distance_map[tz] = overall_min
+            print(f"  tz={tz:5.1f}mm: 最短距離={overall_min:.3f}mm")
+            if overall_min < 0.1:  # 0.1mm以内なら詳細表示
+                for region, info in gap_info.items():
+                    if info["min"] < 0.1:
+                        print(f"    {region}: min={info['min']:.3f}mm, near_count={info['near_count']}")
+    else:
+        tz_distance_map = {}
+        test_positions = [
+            (0.0, 0.0, 0.0, 2.0),
+            (0.0, 0.0, 0.0, 1.0),
+            (0.0, 0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0, -1.0),
+            (0.0, 0.0, 0.0, -2.0),
+        ]
+        for tx, rx, ry, tz in test_positions:
+            gap_info = scorer.region_gap_info(tx, rx, ry, tz, near_th=0.5)
+            min_distances = [info["min"] for info in gap_info.values()]
+            overall_min = min(min_distances)
+            tz_distance_map[tz] = overall_min
+
+    # Step1のtzスキャン範囲を診断結果から自動決定
+    tz_list = []
+    bias_list = []
     contact_tzs = [tz for tz, dist in tz_distance_map.items() if dist < 0.2]
-    
     if contact_tzs:
         tz_contact_min = min(contact_tzs)
         tz_contact_max = max(contact_tzs)
-        # 接触域を中心に±0.5mm余裕を持たせる
-        tz_start_auto = tz_contact_max + 0.5
-        tz_end_auto = tz_contact_min - 0.5
-        print(f"\n✓ [自動設定] 接触域検出: tz={tz_contact_min:.1f}~{tz_contact_max:.1f}mm")
-        print(f"  → Step1スキャン範囲: tz={tz_start_auto:.1f} → {tz_end_auto:.1f}mm")
+        test_tz_values = np.linspace(tz_contact_min, tz_contact_max, 9).tolist()
+        tz_start_auto = tz_contact_max
+        tz_end_auto = tz_contact_min
     else:
-        # 接触域が見つからない場合はデフォルト
-        tz_start_auto = 1.5
+        test_tz_values = np.linspace(1.0, -1.0, 9).tolist()
+        tz_start_auto = 1.0
         tz_end_auto = -1.0
-        print(f"\n⚠️  接触域未検出 → デフォルト範囲: tz={tz_start_auto:.1f} → {tz_end_auto:.1f}mm")
-    
-    # 閉口方向も診断から自動判定
-    # tzを変化させたときの距離変化から判定
-    tz_sorted = sorted(tz_distance_map.items())
-    if len(tz_sorted) >= 2:
-        # 距離が最も減る方向を閉口方向とする
-        min_tz = min(tz_sorted, key=lambda x: x[1])[0]
-        if min_tz < 0:
-            closing_direction = "tz-"
-            closing_sign = -1
-        else:
-            closing_direction = "tz+"
-            closing_sign = +1
-        print(f"✓ [自動判定] 閉口方向: {closing_direction} (最短距離のtz={min_tz:.1f}mm)")
-    else:
-        closing_direction = "tz-"
-        closing_sign = -1
-        print(f"⚠️  閉口方向判定不能 → デフォルト: {closing_direction}")
 
-    print("\n🔍 [重要診断] GPU vs CPU の距離計算整合性テスト:")
-    print("  ⚠️  重要: 以下の測定は tx=0, rx=0, ry=0 の固定条件で実施")
-    print("         GPUバイアスのtz依存性を線形近似し、全Phaseで動的に補正します")
-    print("         (理由: tzが変わるとバイアスも変わるため、固定値では不安定)")
-    print("="*80)
-    print("検証: 接触域でGPUバイアスの特性を確認")
-    bias_list = []
-    tz_list = []
-    
-    # 接触域の代表値でテスト
-    if contact_tzs:
-        test_tz_values = [tz_contact_max, (tz_contact_max + tz_contact_min)/2, tz_contact_min]
-    else:
-        test_tz_values = [1.0, 0.5, 0.0, -0.5, -1.0]
-    
+    closing_sign = -1 if tz_start_auto > tz_end_auto else 1
+
     for tz in test_tz_values:
         tx, rx, ry = 0.0, 0.0, 0.0
-        # CPU診断
         gap_info = scorer.region_gap_info(tx, rx, ry, tz)
         cpu_min = min([info["min"] for info in gap_info.values()])
-        
-        # GPU評価
         score, info = scorer.evaluate(tx, rx, ry, tz)
         gpu_min = info.get("min_dist_raw", 999.0)
-        
         bias = gpu_min - cpu_min
         bias_list.append(bias)
         tz_list.append(tz)
-        
-        print(f"  tz={tz:5.2f}mm: CPU={cpu_min:.4f}mm, GPU={gpu_min:.4f}mm, バイアス={bias:+.4f}mm")
-        if abs(bias) > 0.01:  # 0.01mm以上の差があれば警告
-            if abs(bias) > 0.03:  # 閾値以上なら接触判定に影響
-                print(f"    🔥 CRITICAL: バイアス{bias:+.4f}mmが閾値0.035mmを超過！接触判定が破綻")
-            else:
-                print(f"    ⚠️  バイアス{bias:+.4f}mmが検出（接触判定に影響する可能性）")
-    
-    # バイアス分析
-    bias_arr = np.array(bias_list)
-    tz_arr = np.array(tz_list)
-    bias_median = np.median(bias_arr)
-    bias_std = np.std(bias_arr)
-    bias_range = np.max(bias_arr) - np.min(bias_arr)
-    
-    # 🆕 線形補正パラメータの計算 bias(tz) = a*tz + b
-    if len(tz_arr) >= 2:
-        a, b = np.polyfit(tz_arr, bias_arr, 1)
-        # Scorerに設定
-        scorer.gpu_bias_a = float(a)
-        scorer.gpu_bias_b = float(b)
-        scorer.use_linear_bias_correction = True
-        
-        print(f"\n📊 バイアス分析結果:")
-        print(f"  中央値: {bias_median:+.4f}mm")
-        print(f"  標準偏差: {bias_std:.4f}mm")
-        print(f"  範囲: {bias_range:.4f}mm")
-        print(f"\n🆕 線形補正モデル: bias(tz) = {a:+.6f} * tz + {b:+.4f}")
-        print(f"  → tzに応じてGPUバイアスを動的に補正します")
-        
-        # 確認: 各tzでの補正値を表示
-        print(f"  確認: tz=2.0mm → bias={scorer.gpu_bias_mm(2.0):.4f}mm")
-        print(f"        tz=1.0mm → bias={scorer.gpu_bias_mm(1.0):.4f}mm")
-        print(f"        tz=0.0mm → bias={scorer.gpu_bias_mm(0.0):.4f}mm")
-    else:
-        # データ不足の場合は固定値を使用
-        scorer.gpu_bias = bias_median
-        scorer.use_linear_bias_correction = False
-        
-        print(f"\n📊 バイアス分析結果:")
-        print(f"  中央値: {bias_median:+.4f}mm")
-        print(f"  標準偏差: {bias_std:.4f}mm")
-        print(f"  範囲: {bias_range:.4f}mm")
-    
-    if bias_std < 0.003:  # より厳しい基準
-        print(f"  ✓ 極めて安定（bias補正方式C推奨）: GPU距離から動的に補正")
-        correction_method = "C"
-    elif bias_std < 0.008:
-        print(f"  ○ ある程度安定（bias補正＋CPU確定方式A推奨）")
-        correction_method = "AC"
-    else:
-        print(f"  ⚠️  不安定（CPU確定方式A＋探索緩和方式B推奨）")  
-        correction_method = "AB"
-    
-    print(f"\n🔧 採用対策: 方式A（GPU候補生成＋CPU最終確定）＋方式B（探索時閾値調整）＋方式C（GPUバイアス動的補正）")
-    print(f"   探索時: 臼歯 0.040mm / 前歯 {scorer.contact_threshold_search_ant:.3f}mm（前歯を厳しく）")
-    print(f"   確定時: 臼歯 0.035mm / 前歯 {scorer.contact_threshold_final_ant:.3f}mm（精度重視、後方支持優先）")
-    if scorer.use_linear_bias_correction:
-        print(f"   GPUバイアス: bias(tz) = {scorer.gpu_bias_a:+.6f}*tz + {scorer.gpu_bias_b:+.4f} → CPU相当の距離感に補正")
-    else:
-        print(f"   GPUバイアス: +{scorer.gpu_bias:.4f}mm → CPU相当の距離感に補正")
-    
+        if DIAG:
+            print(f"  tz={tz:5.2f}mm: CPU={cpu_min:.4f}mm, GPU={gpu_min:.4f}mm, バイアス={bias:+.4f}mm")
+            if abs(bias) > 0.01:
+                if abs(bias) > 0.03:
+                    print(f"    [CRITICAL] Bias {bias:+.4f}mm exceeds threshold 0.035mm! Contact judgment is invalid.")
+                else:
+                    print(f"    [WARN] Bias {bias:+.4f}mm detected (may affect contact judgment)")
+
+    # fit_gpu_biasで外れ値耐性線形補正
+    scorer.fit_gpu_bias(tz_list, bias_list)
+    # 以降のバイアス安定性判定・出力はfit_gpu_bias内で行うか、必要に応じて整理してください。
+
     # 対策B+C: 探索時の閾値（バイアス補正が安定しているため0.050→0.040に締められる）
     scorer.contact_threshold_search = 0.040  # バイアス補正により締めても安定
     scorer.contact_threshold_final = scorer.contact_threshold  # 元の厳密閾値を保存
     scorer.contact_threshold_search_ant = 0.032  # 前歯探索用（臼歯より厳しい）
     scorer.contact_threshold_final_ant = 0.028   # 前歯確定用（さらに厳しい）
 
-    # � 接触可能性診断: 絶対当たらない歯を探索から除外  
+    # 接触可能性診断: 絶対当たらない歯を探索から除外  
     scorer.update_feasibility(tx_range=(-0.8, 0.8), tz_range=(-2.0, 2.0))
-    
-    print(f"\n🔧 探索モード開始: contact_threshold = {scorer.contact_threshold_search:.3f}mm（安定性重視）")
+
+    print(f"\n[INFO] Search mode started: contact_threshold = {scorer.contact_threshold_search:.3f}mm (stability prioritized)")
     scorer.search_mode = True  # 探索モード有効化
-    
-    # ⚠️  biasは初期診断時に線形近似されており、tzに応じて動的に補正されます
+
+    # Note: bias is linearly approximated at initial diagnosis and dynamically corrected according to tz
     if scorer.use_linear_bias_correction:
-        print(f"\n🔧 Phase1開始: GPU bias(tz) = {scorer.gpu_bias_a:+.6f}*tz + {scorer.gpu_bias_b:+.4f}（線形補正）")
+        print(f"\n[INFO] Phase1 started: GPU bias(tz) = {scorer.gpu_bias_a:+.6f}*tz + {scorer.gpu_bias_b:+.4f} (linear correction)")
     else:
-        print(f"\n🔧 Phase1開始: GPU bias={scorer.gpu_bias:+.4f}mm（固定値）")
-    
+        print(f"\n[Phase1開始] GPU bias={scorer.gpu_bias:+.4f}mm（固定値）")
+
     # Step1: tz 方向スキャンで初期位置（診断結果から自動決定した範囲を使用）
     best_tz, best_score_tz, info_tz = line_search_tz(
         scorer,
@@ -2096,17 +1796,17 @@ def main():
     print("[Phase1] マルチスタート近傍ヒルクライム（txも含めて最適化）")
     print(f"{'='*80}")
     print(f"  初期位置パターン: [中央, 左寄り, 右寄り] から探索し、最良を選択")
-    
+
     # 3つの初期位置パターン
     start_patterns = [
         {"name": "中央", "tx": 0.0},
         {"name": "左寄り", "tx": -0.2},
         {"name": "右寄り", "tx": +0.2},
     ]
-    
+
     best_overall = None
     best_overall_score = -999.0
-    
+
     for pattern in start_patterns:
         print(f"\n  ★ 初期位置パターン: {pattern['name']} (tx={pattern['tx']:.2f})")
         
@@ -2133,58 +1833,169 @@ def main():
             best_overall_score = score_c
             best_overall = (tx_c, rx_c, ry_c, tz_c, score_c, info_c)
             print(f"    ★ 最良更新! (score={score_c:.3f})")
-    
-    # 最良のパターンを採用
-    tx_best, rx_best, ry_best, tz_best, score_best, info_best = best_overall
-    print(f"\n  ★ Phase1マルチスタート最良: tx={tx_best:.3f}, tz={tz_best:.3f}, score={score_best:.3f}")
-    
-    # 🎯 対策A: 探索完了後、確定モードでCPU最終評価
-    print(f"\n🎯 確定モード切替: contact_threshold = {scorer.contact_threshold_final:.3f}mm（精度重視）")
-    scorer.search_mode = False  # 確定モード（厳密閾値）に切り替え
 
-    # ✅ Phase1結果を CPU strict（Phase2/Phase3と同一関数）で再評価
-    print(f"\n🔍 Phase1最終候補をCPU strict (0.035mm) で再評価...")
-    score_best, info_best = scorer.evaluate(tx_best, rx_best, ry_best, tz_best, force_cpu=True)
-    
-    # 🔍 検査ログ: Phase1最終姿勢と評価を記録
-    print(f"\n[POSE phase1_final] tx={tx_best:.3f} rx={np.rad2deg(rx_best):.3f}° ry={np.rad2deg(ry_best):.3f}° tz={tz_best:.3f}")
-    print(f"[STRICT phase1_final] score={score_best:.3f} area={info_best['total_area']:.4f} contacts={info_best['num_contacts']} dead={info_best['spring_zero']}")
-    ra = info_best["region_areas"]
+
+    # --- strict_guard: Phase1最良候補を必ずstrictでチェックし、deadなら近傍strict回復 ---
+
+    from scipy.spatial.transform import Rotation as R
+    def evaluate_strict_cpu(scorer, tx, rx, ry, tz, contact_threshold=0.035):
+        # 完全にCPU三角形面最近傍距離のみ、閾値も固定
+        rot = R.from_euler("xyz", [rx, ry, 0.0]).as_matrix()
+        p = scorer.pivot
+        transformed = (rot @ (scorer.v0 - p).T).T + p + np.array([tx, 0.0, tz])
+        _, distances, _ = scorer.upper.nearest.on_surface(transformed)
+        dist_raw = np.asarray(distances)
+        mask_ant_np = scorer.region_masks["ANT"]
+        contact_mask = np.where(
+            mask_ant_np,
+            dist_raw <= contact_threshold if hasattr(scorer, "contact_threshold_final_ant") else contact_threshold,
+            dist_raw <= contact_threshold
+        )
+        areas_array = scorer.areas
+        d_array = np.clip(dist_raw, 0.0, 0.05)
+        d_c = d_array[contact_mask]
+        is_ant_contact = mask_ant_np[contact_mask]
+        th_array = np.where(is_ant_contact, scorer.contact_threshold_final_ant if hasattr(scorer, "contact_threshold_final_ant") else contact_threshold, contact_threshold)
+        w = 1.0 - (d_c / th_array) ** 2
+        w = np.clip(w, 0.0, 1.0)
+        local_strength_c = areas_array[contact_mask] * w
+        strength_full = np.zeros_like(areas_array)
+        area_full = np.zeros_like(areas_array)
+        area_eff_full = np.zeros_like(areas_array)
+        strength_full[contact_mask] = local_strength_c
+        area_full[contact_mask] = areas_array[contact_mask]
+        area_eff_full[contact_mask] = local_strength_c
+        region_scores = {}
+        region_areas = {}
+        scores_list = []
+        feasible_regions = [name for name in scorer.valid_regions if name not in scorer.infeasible_regions]
+        for name in feasible_regions:
+            mask = scorer.region_masks[name]
+            s = float(strength_full[mask].sum())
+            a = float(area_full[mask].sum())
+            region_scores[name] = s
+            region_areas[name] = a
+            scores_list.append(s)
+        for name in scorer.region_masks.keys():
+            if name not in region_scores:
+                region_scores[name] = 0.0
+                region_areas[name] = 0.0
+        scores_arr = np.array(scores_list, dtype=float)
+        total_strength = float(scores_arr.sum())
+        total_area = float(area_full.sum())
+        total_area_eff = float(area_eff_full.sum())
+        left_area = region_areas["M_L"] + region_areas["PM_L"]
+        right_area = region_areas["M_R"] + region_areas["PM_R"]
+        anterior_area = region_areas["ANT"]
+        posterior_area = left_area + right_area
+        rot_pen = scorer.rot_penalty * (abs(rx) + abs(ry))
+        trans_pen = scorer.trans_penalty * np.sqrt(tx * tx + tz * tz)
+        right_bonus = 0.2 * (region_scores.get("M_R", 0) + region_scores.get("PM_R", 0))
+        dead_eps = scorer.dead_eps_final
+        strengths = {name: float(region_scores.get(name, 0.0)) for name in feasible_regions}
+        dead_regions = [name for name, s in strengths.items() if s < dead_eps]
+        min_region = min(strengths.values()) if strengths else 0.0
+        var_region = float(np.var(list(strengths.values()))) if strengths else 0.0
+        mean_region = float(np.mean(list(strengths.values()))) if strengths else 0.0
+        dead_springs = len(dead_regions)
+        contact_count_int = int(np.sum(contact_mask))
+        info = {
+            "total_area": total_area,
+            "total_area_eff": total_area_eff,
+            "num_contacts": contact_count_int,
+            "region_areas": region_areas,
+            "region_scores": region_scores,
+            "left_area": left_area,
+            "right_area": right_area,
+            "anterior_area": anterior_area,
+            "posterior_area": posterior_area,
+            "spring_min": min_region,
+            "spring_var": var_region,
+            "spring_mean": mean_region,
+            "dead_springs": dead_springs,
+            "dead_eps": dead_eps,
+            "strengths": strengths,
+            "dead_regions": dead_regions,
+            "tx": tx,
+            "rx": rx,
+            "ry": ry,
+            "tz": tz,
+            "min_dist_raw": float(np.partition(dist_raw, max(1, int(0.01 * dist_raw.size)))[max(1, int(0.01 * dist_raw.size))]),
+        }
+        score = (
+            0.4 * total_strength
+            + 1.8 * min_region
+            - 0.3 * var_region
+            - 0.8 * dead_springs
+            + right_bonus
+            - rot_pen
+            - trans_pen
+        )
+        return score, info
+
+    def strict_guard(pose, scorer, max_tries=2):
+        tx, rx, ry, tz, _, _ = pose
+        score_s, info_s = evaluate_strict_cpu(scorer, tx, rx, ry, tz, contact_threshold=0.035)
+        print(f"[DEBUG] strict_mode=cpu_triangle contact_threshold=0.035 dead={info_s['dead_springs']} contacts={info_s['num_contacts']}")
+        if info_s['dead_springs'] == 0:
+            return (tx, rx, ry, tz, score_s, info_s)
+        for _ in range(max_tries):
+            best = (tx, rx, ry, tz, score_s, info_s)
+            for dtz in [-0.02, 0, 0.02]:
+                for dtx in [-0.1, 0, 0.1]:
+                    for drx in [np.deg2rad(-0.5), 0, np.deg2rad(0.5)]:
+                        for dry in [np.deg2rad(-0.5), 0, np.deg2rad(0.5)]:
+                            if dtz==0 and dtx==0 and drx==0 and dry==0:
+                                continue
+                            tx2 = tx + dtx
+                            rx2 = rx + drx
+                            ry2 = ry + dry
+                            tz2 = tz + dtz
+                            score2, info2 = evaluate_strict_cpu(scorer, tx2, rx2, ry2, tz2, contact_threshold=0.035)
+                            if info2['dead_springs'] < best[5]['dead_springs'] or (info2['dead_springs']==0 and score2>best[4]):
+                                best = (tx2, rx2, ry2, tz2, score2, info2)
+            tx, rx, ry, tz, score_s, info_s = best
+            print(f"[DEBUG] strict_mode=cpu_triangle contact_threshold=0.035 dead={info_s['dead_springs']} contacts={info_s['num_contacts']}")
+            if info_s['dead_springs'] == 0:
+                break
+        return (tx, rx, ry, tz, score_s, info_s)
+
+    # strict_guardでPhase1最良をstrict世界に揃える
+
+
+    # best_overall から pose値を展開
+    tx_best, rx_best, ry_best, tz_best, _, _ = best_overall
+    phase1_pose = {
+        'tx': tx_best,
+        'rx': rx_best,
+        'ry': ry_best,
+        'tz': tz_best
+    }
+    score_strict, info_strict = evaluate_strict_cpu(scorer, tx_best, rx_best, ry_best, tz_best, contact_threshold=0.035)
+    phase1_strict_result = {
+        'pose': phase1_pose.copy(),
+        'score': score_strict,
+        'info': info_strict
+    }
+
+    print(f"\n  ★ Phase1マルチスタート最良: tx={tx_best:.6f}, tz={tz_best:.6f}, score={score_strict:.3f}")
+    print(f"[DEBUG] strict_mode=cpu_triangle contact_threshold=0.035 dead={info_strict['dead_springs']} contacts={info_strict['num_contacts']}")
+    print(f"\n[POSE phase1_final] tx={tx_best:.6f} rx={np.rad2deg(rx_best):.3f}° ry={np.rad2deg(ry_best):.3f}° tz={tz_best:.6f}")
+    print(f"[STRICT phase1_final] score={score_strict:.3f} area={info_strict['total_area']:.4f} contacts={info_strict['num_contacts']} dead={info_strict['dead_springs']}")
+    ra = info_strict["region_areas"]
     print(f"  area_by_region: M_L={ra['M_L']:.4f} M_R={ra['M_R']:.4f} PM_L={ra['PM_L']:.4f} PM_R={ra['PM_R']:.4f} ANT={ra['ANT']:.4f}")
 
-    print("\nPhase1 結果（ノーマル咬合位置）")
-    print("-" * 80)
-    print(f"  tx = {tx_best:6.3f} mm")
-    print(f"  rx = {np.rad2deg(rx_best):6.3f} °")
-    print(f"  ry = {np.rad2deg(ry_best):6.3f} °")
-    print(f"  tz = {tz_best:6.3f} mm")
-    print(f"  score           = {score_best:.3f}")
-    print(f"  total area      = {info_best['total_area']:.4f} mm²")
-    print(f"  M_L area        = {ra['M_L']:.4f} mm²")
-    print(f"  M_R area        = {ra['M_R']:.4f} mm²")
-    print(f"  PM_L area       = {ra['PM_L']:.4f} mm²")
-    print(f"  PM_R area       = {ra['PM_R']:.4f} mm²")
-    print(f"  ANT area        = {ra['ANT']:.4f} mm²")
-    print(f"  contacts        = {info_best['num_contacts']} points")
-    print(f"  spring min      = {info_best['spring_min']:.4f}")
-    print(f"  spring var      = {info_best['spring_var']:.4f}")
-    print(f"  dead springs    = {info_best['spring_zero']}")
-    print(f"  🔍 min_dist_raw = {info_best.get('min_dist_raw', 'N/A'):.4f} mm")
-    print("-" * 80)
+    # Phase2開始時は再評価せず、Phase1 strict結果をそのまま使う
+    print(f"\n[POSE phase2_base] tx={phase1_strict_result['pose']['tx']:.6f} rx={np.rad2deg(phase1_strict_result['pose']['rx']):.3f}° ry={np.rad2deg(phase1_strict_result['pose']['ry']):.3f}° tz={phase1_strict_result['pose']['tz']:.6f}")
+    print(f"[STRICT phase2_base] score={phase1_strict_result['score']:.3f} area={phase1_strict_result['info']['total_area']:.4f} contacts={phase1_strict_result['info']['num_contacts']} dead={phase1_strict_result['info']['dead_springs']}")
+    ra2 = phase1_strict_result['info']["region_areas"]
+    print(f"  area_by_region: M_L={ra2['M_L']:.4f} M_R={ra2['M_R']:.4f} PM_L={ra2['PM_L']:.4f} PM_R={ra2['PM_R']:.4f} ANT={ra2['ANT']:.4f}")
 
-    rs = info_best["region_scores"]
-    print("\n  [region_scores (strength)]")
-    print(f"  M_L={rs['M_L']:.6f}, M_R={rs['M_R']:.6f}, "
-          f"PM_L={rs['PM_L']:.6f}, PM_R={rs['PM_R']:.6f}, ANT={rs['ANT']:.6f}")
+    # Phase2/3で同じposeが出た場合は再評価せずキャッシュを使うように、gyu_refine_tz等のtzスキャン部で工夫が必要（例: abs(tz_candidate - phase1_strict_result['pose']['tz']) < 1e-9 ならキャッシュ利用）
 
-    left_s  = rs["M_L"] + rs["PM_L"]
-    right_s = rs["M_R"] + rs["PM_R"]
-    denom = left_s + right_s + 1e-9
-    print(f"  L_strength={left_s:.6f}, R_strength={right_s:.6f}, "
-          f"L_ratio={left_s/denom:.3f}")
 
     # ★ Phase2: tz だけを少し「ギュッ」と噛み込ませる（CPU確定モードで実行）
-    print(f"\n🔧 Phase2 CPU確定モード: contact_threshold = 0.035mm（Phase3と同じ評価関数）")
+    print(f"\n[INFO] Phase2 CPU final mode: contact_threshold = 0.035mm (same evaluation function as Phase3)")
     scorer.search_mode = False  # ✅ CPU確定モードに切り替え（Phase3と同一条件）
     
     tz_gyu, score_gyu, info_gyu = gyu_refine_tz(
@@ -2193,6 +2004,7 @@ def main():
         extra_depth=0.10,  # ← ギュッとする最大量（mm）。0.05〜0.10 あたりから調整
         step=-0.01,        # 0.01mm 刻み
         closing_sign=closing_sign,  # 診断から自動判定された閉口方向
+        phase1_strict_result=phase1_strict_result
     )
 
     print("\n最終結果（Phase2: ちょっとギュッ後）")
@@ -2202,18 +2014,18 @@ def main():
     print(f"  ry = {np.rad2deg(ry_best):6.3f} °")
     print(f"  tz = {tz_gyu:6.3f} mm")              # tz だけ gyu 版
     print(f"  score           = {score_gyu:.3f}")
-    print(f"  total area      = {info_gyu['total_area']:.4f} mm²")
+    print(f"  total area      = {info_gyu['total_area']:.4f} mm^2")
     ra2 = info_gyu["region_areas"]
-    print(f"  M_L area        = {ra2['M_L']:.4f} mm²")
-    print(f"  M_R area        = {ra2['M_R']:.4f} mm²")
-    print(f"  PM_L area       = {ra2['PM_L']:.4f} mm²")
-    print(f"  PM_R area       = {ra2['PM_R']:.4f} mm²")
-    print(f"  ANT area        = {ra2['ANT']:.4f} mm²")
+    print(f"  M_L area        = {ra2['M_L']:.4f} mm^2")
+    print(f"  M_R area        = {ra2['M_R']:.4f} mm^2")
+    print(f"  PM_L area       = {ra2['PM_L']:.4f} mm^2")
+    print(f"  PM_R area       = {ra2['PM_R']:.4f} mm^2")
+    print(f"  ANT area        = {ra2['ANT']:.4f} mm^2")
     print(f"  contacts        = {info_gyu['num_contacts']} points")
     print(f"  spring min      = {info_gyu['spring_min']:.4f}")
     print(f"  spring var      = {info_gyu['spring_var']:.4f}")
-    print(f"  dead springs    = {info_gyu['spring_zero']}")
-    print(f"  🔍 min_dist_raw = {info_gyu.get('min_dist_raw', 'N/A'):.4f} mm")
+    print(f"  dead springs    = {info_gyu['dead_springs']}")
+    print(f"  [INFO] min_dist_raw = {info_gyu.get('min_dist_raw', 'N/A'):.4f} mm")
     print("-" * 80)
 
     rs2 = info_gyu["region_scores"]
@@ -2234,11 +2046,14 @@ def main():
     print(f"[Phase3] CPU確定モード(0.035mm)で最終リファインします", flush=True)
     print(f"{'='*80}", flush=True)
     scorer.search_mode = False  # 確定モード（閾値0.035）
-    # ⚠️  biasは初期診断時に固定されているため、再測定せず全Phaseで再利用
-    print(f"  🔧 GPU bias={scorer.gpu_bias:+.4f}mm（初期診断から再利用）", flush=True)
+    # Phase1で推定したGPUバイアス補正を必ず再利用
+    if scorer.use_linear_bias_correction:
+        print(f"  [INFO] GPU bias(tz) = {scorer.gpu_bias_a:+.6f}*tz + {scorer.gpu_bias_b:+.4f} (reused from Phase1, linear correction)", flush=True)
+    else:
+        print(f"  [INFO] GPU bias={scorer.gpu_bias:+.4f}mm (reused from Phase1)", flush=True)
 
     # ✅ Phase3開始前に、Phase2の最終姿勢で strict再評価（obj/score/info を統一）
-    print(f"\n🔍 Phase3開始前: Phase2最終姿勢(tx={tx_best:.3f}, tz={tz_gyu:.3f})を strict で再評価...")
+    print(f"\n[INFO] Phase3 pre-check: Re-evaluating Phase2 final pose (tx={tx_best:.3f}, tz={tz_gyu:.3f}) in strict mode...")
     obj_start, score_start, info_start = objective(
         tx_best, rx_best, ry_best, tz_gyu, scorer, 
         w_lr=1.5, w_pml=0.9, pml_margin=0.10, w_mr=0.3, 
@@ -2258,8 +2073,8 @@ def main():
     excess_debug = max(0.0, pm_l_share_start - (scorer.target_PM_L_share + 0.10))
     mr_debug = rs_debug["M_R"]
     obj_calc = score_start - 1.2 * pen_lr_debug - 0.8 * excess_debug + 0.4 * mr_debug
-    print(f"  🐞 DEBUG: score={score_start:.3f}, pen_lr={pen_lr_debug:.3f}, excess={excess_debug:.3f}, mr={mr_debug:.3f}")
-    print(f"  🐞 obj計算: {score_start:.3f} - 1.2*{pen_lr_debug:.3f} - 0.8*{excess_debug:.3f} + 0.4*{mr_debug:.3f} = {obj_calc:.3f}")
+    print(f"  [DEBUG] score={score_start:.3f}, pen_lr={pen_lr_debug:.3f}, excess={excess_debug:.3f}, mr={mr_debug:.3f}")
+    print(f"  [DEBUG] obj calc: {score_start:.3f} - 1.2*{pen_lr_debug:.3f} - 0.8*{excess_debug:.3f} + 0.4*{mr_debug:.3f} = {obj_calc:.3f}")
     
     print(f"  [STRICT phase3_start] obj={obj_start:.3f} score={score_start:.3f} "
           f"area={info_start['total_area']:.4f} contacts={info_start['num_contacts']} "
@@ -2290,27 +2105,27 @@ def main():
     print(f"  ry = {np.rad2deg(ry3):6.3f} °")
     print(f"  tz = {tz3:6.3f} mm")
     print(f"  score           = {score3:.3f}")
-    print(f"  total area      = {info3['total_area']:.4f} mm²")
+    print(f"  total area      = {info3['total_area']:.4f} mm^2")
     ra3 = info3["region_areas"]
-    print(f"  M_L area        = {ra3['M_L']:.4f} mm²")
-    print(f"  M_R area        = {ra3['M_R']:.4f} mm²")
-    print(f"  PM_L area       = {ra3['PM_L']:.4f} mm²")
-    print(f"  PM_R area       = {ra3['PM_R']:.4f} mm²")
-    print(f"  ANT area        = {ra3['ANT']:.4f} mm²")
+    print(f"  M_L area        = {ra3['M_L']:.4f} mm^2")
+    print(f"  M_R area        = {ra3['M_R']:.4f} mm^2")
+    print(f"  PM_L area       = {ra3['PM_L']:.4f} mm^2")
+    print(f"  PM_R area       = {ra3['PM_R']:.4f} mm^2")
+    print(f"  ANT area        = {ra3['ANT']:.4f} mm^2")
     print(f"  contacts        = {info3['num_contacts']} points")
     print(f"  spring min      = {info3['spring_min']:.4f}")
     print(f"  spring var      = {info3['spring_var']:.4f}")
-    print(f"  dead springs    = {info3['spring_zero']}")
-    print(f"  🔍 min_dist_raw = {info3.get('min_dist_raw', 'N/A'):.4f} mm")
+    print(f"  dead springs    = {info3['dead_springs']}")
+    print(f"  [INFO] min_dist_raw = {info3.get('min_dist_raw', 'N/A'):.4f} mm")
     
     # ★ Phase3結果の深噛み警告
     min_dist_p3 = info3.get('min_dist_raw', 999.0)
     if min_dist_p3 < 0.005:
-        print(f"  ⚠️  深噛み警告: min_dist_raw={min_dist_p3:.4f}mm < 0.005mm（めり込みリスク）")
+        print(f"  [WARN] Deep bite warning: min_dist_raw={min_dist_p3:.4f}mm < 0.005mm (risk of penetration)")
     elif min_dist_p3 < 0.010:
-        print(f"  ⚠️  注意: min_dist_raw={min_dist_p3:.4f}mm < 0.010mm（やや深い噛み込み）")
+        print(f"  [WARN] Caution: min_dist_raw={min_dist_p3:.4f}mm < 0.010mm (slightly deep bite)")
     else:
-        print(f"  ✓ min_dist_raw={min_dist_p3:.4f}mm（良好）")
+        print(f"  [OK] min_dist_raw={min_dist_p3:.4f}mm (good)")
     
     print("-" * 80)
 
@@ -2361,35 +2176,38 @@ def main():
     best_score_obj = base_obj
     best_score_comp = base_comp
 
-    # ⚡ 高速化：±0.03mm を 0.01mm刻みでGPU評価 → 上位のみCPU確定
-    print("\n  🔍 Phase3b: GPU評価で候補絞り込み → 上位CPU確定（高速化）")
+    # [INFO] Fast screening: ±0.03mm in 0.01mm steps by GPU, then top candidates confirmed by CPU
+    print("\n  [INFO] Phase3b: Candidate screening by GPU evaluation → Top confirmed by CPU (fast mode)")
     print("  範囲: ±0.03mm（0.01mm刻み）、GPU評価 → 上位5個をCPU確定")
     
     # 1) GPU評価で全候補をスクリーニング（高速）
-    gpu_candidates = []
-    for i in range(-3, 4):  # -0.03 ... +0.03（7候補）
-        dtz = i * 0.015
+    candidates = []
+    scan_range = range(-3, 4)  # -0.03 ... +0.03（7候補）
+    step = 0.015
+    for i in scan_range:
+        dtz = i * step
         cand_tz = tz0 + dtz
         s_gpu, info_gpu = scorer.evaluate(tx0, rx0, ry0, cand_tz, force_cpu=False)
         obj_gpu, comp_gpu = objective_from_info(s_gpu, info_gpu, scorer, w_lr, w_pml, pml_margin, w_mr)
-        gpu_candidates.append((obj_gpu, s_gpu, cand_tz, dtz))
+        candidates.append((obj_gpu, s_gpu, cand_tz, dtz))
     
     # 2) GPU評価でobjective上位5個を選定
-    gpu_candidates.sort(reverse=True, key=lambda x: x[0])
+    candidates.sort(reverse=True, key=lambda x: x[0])
     TOP_K = 5
-    print(f"  GPU評価: {len(gpu_candidates)}候補 → objective上位{TOP_K}個をCPU確定中...")
+    print(f"  GPU評価: {len(candidates)}候補 → objective上位{TOP_K}個をCPU確定中...")
     
     # 3) 上位のみCPU確定評価
     print("\n  CPU確定結果:")
-    print("  🔍 各行の意味: pen_lr=左右バランス罰, pen_pml_s=PM_L不足罰, pen_ant=前歯過多罰, pen_deep=深噛み罰, mr=右大臼歯報酬")
-    print("                L_ratio=左側割合, ANT_share=前歯割合, PM_L_a=PM_L面積, min_dist=最小距離(めり込み検知)")
+    print("  [INFO] Legend: pen_lr=left/right balance penalty, pen_pml_s=PM_L shortage penalty, pen_ant=anterior excess penalty, pen_deep=deep bite penalty, mr=right molar reward")
+    print("                L_ratio=left ratio, ANT_share=anterior ratio, PM_L_a=PM_L area, min_dist=minimum distance (penetration check)")
     
-    for obj_gpu, s_gpu, cand_tz, dtz in gpu_candidates[:TOP_K]:
+    for obj_cand, s_cand, cand_tz, dtz in candidates[:TOP_K]:
+        # 各候補をCPU strictで必ず再評価
         s, info = scorer.evaluate(tx0, rx0, ry0, cand_tz, force_cpu=True)
         obj, comp = objective_from_info(s, info, scorer, w_lr, w_pml, pml_margin, w_mr)
 
         marker_obj = "★" if obj > best_obj else " "
-        marker_score = "◆" if s > best_score else " "
+        marker_score = "*" if s > best_score else " "
         marker = marker_obj + marker_score
         
         print(f"  {marker} tz={cand_tz:.3f} (dtz={dtz:+.3f}) obj={obj:.3f} score={s:.3f} area={info['total_area']:.4f} "
@@ -2406,7 +2224,7 @@ def main():
             best_score_obj, best_score_comp = obj, comp
 
     print(f"\n[Phase3b] objective最良: tz={best_tz:.3f} obj={best_obj:.3f} score={best_s:.3f} area={best_info['total_area']:.4f} "
-          f"contacts={best_info['num_contacts']} dead={best_info['spring_zero']} spring_min={best_info['spring_min']:.4f}")
+          f"contacts={best_info['num_contacts']} dead={best_info['dead_springs']} spring_min={best_info['spring_min']:.4f}")
     
     # ★ 深噛み・ANT過多・PM_L不足の警告表示
     is_watertight = getattr(scorer, 'mesh_is_watertight', True)
@@ -2414,47 +2232,47 @@ def main():
     warning_th = 0.010 if is_watertight else 0.015
     
     if best_comp.get("deep_bite_warning", False):
-        print(f"  ⚠️  深噛み警告: min_dist_raw={best_comp['min_dist_raw']:.4f}mm < {critical_th:.3f}mm（めり込みリスク）")
-        print(f"      → STL水密化＋score最良（tz={best_score_tz:.3f}）の採用を検討してください")
+        print(f"  [WARN] Deep bite warning: min_dist_raw={best_comp['min_dist_raw']:.4f}mm < {critical_th:.3f}mm (risk of penetration)")
+        print(f"      [INFO] Consider using watertight STL + best score (tz={best_score_tz:.3f})")
     elif best_comp["min_dist_raw"] < warning_th:
-        print(f"  ⚠️  注意: min_dist_raw={best_comp['min_dist_raw']:.4f}mm < {warning_th:.3f}mm（やや深い噛み込み）")
+        print(f"  [WARN] Caution: min_dist_raw={best_comp['min_dist_raw']:.4f}mm < {warning_th:.3f}mm (slightly deep bite)")
     else:
-        print(f"  ✓ min_dist_raw={best_comp['min_dist_raw']:.4f}mm（良好）")
+        print(f"  [INFO] min_dist_raw={best_comp['min_dist_raw']:.4f}mm (good)")
     
     if best_comp.get("ANT_critical", False):
-        print(f"  ⚠️  前歯過多警告: ANT_share={best_comp['ANT_share']:.1%} > 40%（臼歯支持不足）")
+        print(f"  [WARN] Anterior excess warning: ANT_share={best_comp['ANT_share']:.1%} > 40% (insufficient molar support)")
     elif best_comp["ANT_share"] > 0.30:
-        print(f"  ⚠️  注意: ANT_share={best_comp['ANT_share']:.1%} > 30%（やや前歯優位）")
+        print(f"  [WARN] Caution: ANT_share={best_comp['ANT_share']:.1%} > 30% (slightly anterior dominant)")
     else:
-        print(f"  ✓ ANT_share={best_comp['ANT_share']:.1%}（良好）")
+        print(f"  [INFO] ANT_share={best_comp['ANT_share']:.1%} (good)")
     
     if best_comp["PM_L_area"] < 0.01:
-        print(f"  ⚠️  PM_L不足警告: 面積={best_comp['PM_L_area']:.4f}mm² < 0.01mm²（左小臼歯支持不足、点数={best_comp['PM_L_count']}点）")
+        print(f"  [WARN] PM_L shortage warning: area={best_comp['PM_L_area']:.4f}mm^2 < 0.01mm^2 (insufficient left premolar support, count={best_comp['PM_L_count']})")
     else:
-        print(f"  ✓ PM_L面積={best_comp['PM_L_area']:.4f}mm²、点数={best_comp['PM_L_count']}点（良好）")
+        print(f"  [INFO] PM_L area={best_comp['PM_L_area']:.4f}mm^2, count={best_comp['PM_L_count']} (good)")
     
     if abs(best_score_tz - best_tz) > 0.001:
         print(f"\n[Phase3b] score最良:     tz={best_score_tz:.3f} obj={best_score_obj:.3f} score={best_score:.3f} area={best_score_info['total_area']:.4f} "
-              f"contacts={best_score_info['num_contacts']} dead={best_score_info['spring_zero']} (★比較用に別保存)")
+              f"contacts={best_score_info['num_contacts']} dead={best_score_info['dead_springs']} (★比較用に別保存)")
         
         # ★ score最良が危険域の場合は却下警告
         score_is_dangerous = best_score_comp["min_dist_raw"] < 0.001  # 1µm未満は非水密の影響で不信頼
         
         if score_is_dangerous:
-            print(f"  🚫 危険域判定: min_dist_raw={best_score_comp['min_dist_raw']:.4f}mm < 0.001mm（非水密STLの影響で不信頼）")
-            print(f"      → score最良は保存しますが、objective最良（tz={best_tz:.3f}）の採用を強く推奨します")
+            print(f"  [ERR] Dangerous region: min_dist_raw={best_score_comp['min_dist_raw']:.4f}mm < 0.001mm (unreliable due to non-watertight STL)")
+            print(f"      [INFO] Score-best is saved, but strongly recommend using objective-best (tz={best_tz:.3f})")
         elif best_score_comp.get("deep_bite_warning", False):
-            print(f"  ⚠️  深噛み警告: min_dist_raw={best_score_comp['min_dist_raw']:.4f}mm < {critical_th:.3f}mm")
+            print(f"  [WARN] Deep bite warning: min_dist_raw={best_score_comp['min_dist_raw']:.4f}mm < {critical_th:.3f}mm")
         elif best_score_comp["min_dist_raw"] < warning_th:
-            print(f"  ⚠️  注意: min_dist_raw={best_score_comp['min_dist_raw']:.4f}mm < {warning_th:.3f}mm")
+            print(f"  [WARN] Caution: min_dist_raw={best_score_comp['min_dist_raw']:.4f}mm < {warning_th:.3f}mm")
         else:
-            print(f"  ✓ min_dist_raw={best_score_comp['min_dist_raw']:.4f}mm（良好）")
+            print(f"  [OK] min_dist_raw={best_score_comp['min_dist_raw']:.4f}mm (good)")
         
         if best_score_comp.get("ANT_critical", False):
-            print(f"  ⚠️  前歯過多警告: ANT_share={best_score_comp['ANT_share']:.1%} > 40%")
+            print(f"  [WARN] Anterior excess warning: ANT_share={best_score_comp['ANT_share']:.1%} > 40%")
         if best_score_comp["PM_L_area"] < 0.01:
-            print(f"  ⚠️  PM_L不足警告: 面積={best_score_comp['PM_L_area']:.4f}mm² < 0.01mm²")
-            print(f"  ⚠️  PM_L不足警告: 接触点数={best_score_comp['PM_L_count']}点 < 2点")
+            print(f"  [WARN] PM_L shortage warning: area={best_score_comp['PM_L_area']:.4f}mm^2 < 0.01mm^2")
+            print(f"  [WARN] PM_L shortage warning: contact count={best_score_comp['PM_L_count']} < 2")
     else:
         print(f"  → objective最良とscore最良が一致しています")
     
@@ -2475,20 +2293,27 @@ def main():
     pivot_lower = lower.vertices.mean(axis=0)
     
     # 変換行列 A を構築（下顎に適用する変換）
-    A = build_transform_matrix(
-        tx=final_tx,
-        ty=final_ty,
-        rx_rad=final_rx,
-        ry_rad=final_ry,
-        tz=final_tz,
-        pivot=pivot_lower
-    )
+
+    # --- 剛体変換行列Aを直接構築（build_transform_matrixの代替） ---
+    from scipy.spatial.transform import Rotation as R
+    rot_matrix = R.from_euler("xyz", [final_rx, final_ry, 0.0]).as_matrix()
+    translation = np.array([final_tx, final_ty, final_tz])
+    pivot = pivot_lower if pivot_lower is not None else np.zeros(3)
+    T_neg_pivot = np.eye(4)
+    T_neg_pivot[:3, 3] = -pivot
+    R_mat = np.eye(4)
+    R_mat[:3, :3] = rot_matrix
+    T_pivot = np.eye(4)
+    T_pivot[:3, 3] = pivot
+    T_trans = np.eye(4)
+    T_trans[:3, 3] = translation
+    A = T_trans @ T_pivot @ R_mat @ T_neg_pivot
     
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # 📊 最終変換行列Aの出力（再現性・比較用）
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     print(f"\n{'='*80}")
-    print("📊 最終変換行列 A（下顎に適用）")
+    print("[INFO] Final transformation matrix A (applied to lower jaw)")
     print(f"{'='*80}")
     print(f"  姿勢パラメータ:")
     print(f"    tx = {final_tx:8.4f} mm")
@@ -2500,9 +2325,9 @@ def main():
     print(f"\n  4×4 変換行列 A:")
     for i in range(4):
         print(f"    [{A[i,0]:10.6f} {A[i,1]:10.6f} {A[i,2]:10.6f} {A[i,3]:10.6f}]")
-    print(f"\n  ✓ この行列Aは再現性のため保存してください")
-    print(f"  ✓ 下顎出力: lower' = A × lower")
-    print(f"  ✓ 上顎出力: upper' = A⁻¹ × upper（相対咬合は完全一致）")
+    print(f"\n  [INFO] Please save this matrix A for reproducibility")
+    print(f"  [INFO] Lower jaw output: lower' = A x lower")
+    print(f"  [INFO] Upper jaw output: upper' = A^-1 x upper (relative occlusion is identical)")
     print(f"{'='*80}\n")
     
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2510,50 +2335,69 @@ def main():
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     if output_mode == "lower":
         # 【下顎出力モード】下顎に A を適用
-        lower_transformed = apply_transform_to_points(lower.vertices, A)
-        
+        N = lower.vertices.shape[0]
+        lower_hom = np.hstack([lower.vertices, np.ones((N, 1))])
+        lower_transformed = (A @ lower_hom.T).T[:, :3]
+
         output_mesh = lower.copy()
         output_mesh.vertices = lower_transformed
-        
+
         out_dir = os.path.dirname(lower_path)
         jaw_name = os.path.splitext(os.path.basename(lower_path))[0]
-        out_path = os.path.join(out_dir, f"{jaw_name}_spring5_balanced_gyu_v4.stl")
-        
-        output_mesh.export(out_path)
-        
-        print(f"\n✓ 【下顎出力】変換後STL: {out_path}")
+        out_path = os.path.join(out_dir, f"{jaw_name}_spring5_balanced.stl")
+
+        print(f"[DEBUG] Try saving STL to: {out_path}")
+        try:
+            output_mesh.export(out_path)
+            print(f"\n[INFO] [Lower jaw output] Transformed STL: {out_path}")
+        except Exception as e:
+            print(f"[ERROR] Failed to save STL: {out_path}")
+            print(f"[ERROR] Exception: {e}")
         
     else:
         # 【上顎出力モード】上顎に A⁻¹ を適用（相対咬合は完全一致）
         A_inv = np.linalg.inv(A)
-        upper_transformed = apply_transform_to_points(upper.vertices, A_inv)
-        
+        N = upper.vertices.shape[0]
+        upper_hom = np.hstack([upper.vertices, np.ones((N, 1))])
+        upper_transformed = (A_inv @ upper_hom.T).T[:, :3]
+
         output_mesh = upper.copy()
         output_mesh.vertices = upper_transformed
-        
+
         out_dir = os.path.dirname(upper_path)
         jaw_name = os.path.splitext(os.path.basename(upper_path))[0]
-        out_path = os.path.join(out_dir, f"{jaw_name}_spring5_balanced_gyu_v4.stl")
+        out_path = os.path.join(out_dir, f"{jaw_name}_spring5_balanced.stl")
+
+        print(f"[DEBUG] Try saving STL to: {out_path}")
+        try:
+            output_mesh.export(out_path)
+            print(f"\n[INFO] [Upper jaw output] Transformed STL: {out_path}")
+        except Exception as e:
+            print(f"[ERROR] Failed to save STL: {out_path}")
+            print(f"[ERROR] Exception: {e}")
         
-        output_mesh.export(out_path)
-        
-        print(f"\n✓ 【上顎出力】変換後STL: {out_path}")
-        print(f"  （下顎は元のまま、上顎を A⁻¹ で移動 → 下顎出力と相対咬合は完全一致）")
+        print(f"\n[INFO] [Upper jaw output] Transformed STL: {out_path}")
+        print(f"  （下顎は元のまま、上顎を A-1 で移動 → 下顎出力と相対咬合は完全一致）")
     
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # 検証：変換行列の再現性チェック
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     if output_mode == "lower":
-        reconstructed = apply_transform_to_points(lower.vertices, A)
+        # 4x4変換行列Aを直接適用
+        N = lower.vertices.shape[0]
+        lower_hom = np.hstack([lower.vertices, np.ones((N, 1))])
+        reconstructed = (A @ lower_hom.T).T[:, :3]
         rms_error = np.sqrt(np.mean((lower_transformed - reconstructed)**2))
     else:
-        reconstructed = apply_transform_to_points(upper.vertices, A_inv)
+        N = upper.vertices.shape[0]
+        upper_hom = np.hstack([upper.vertices, np.ones((N, 1))])
+        reconstructed = (A_inv @ upper_hom.T).T[:, :3]
         rms_error = np.sqrt(np.mean((upper_transformed - reconstructed)**2))
     print(f"  [検証] 変換の内部一貫性: RMS誤差 = {rms_error:.6e} mm")
     if rms_error > 1e-6:
         print(f"  ⚠️  警告: RMS誤差が大きい（{rms_error:.3e} mm）")
     else:
-        print(f"  ✓ 変換は正しく適用されています")
+        print(f"  [INFO] Transformation applied correctly")
     
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # 処理時間の表示
@@ -2566,9 +2410,9 @@ def main():
     
     print("=" * 80)
     if minutes > 0:
-        print(f"⏱️  処理時間: {minutes}分 {seconds:.2f}秒")
+        print(f"[INFO] Elapsed time: {minutes} min {seconds:.2f} sec")
     else:
-        print(f"⏱️  処理時間: {seconds:.2f}秒")
+        print(f"[INFO] Elapsed time: {seconds:.2f} sec")
     print("=" * 80)
 
 def objective(tx, rx, ry, tz, scorer,
@@ -2603,6 +2447,7 @@ def gyu_refine_tz(
     w_pml=0.9,         # 0.8→0.9
     pml_margin=0.10,
     w_mr=0.3,          # 0.4→0.3（右大臼歯報酬減）
+    phase1_strict_result=None,
 ):
     print("\n[Phase2: gyu_refine_tz] 2段階評価（軽い絞込→厳密決定）")
     
@@ -2613,12 +2458,12 @@ def gyu_refine_tz(
     base_score, base_info = scorer.evaluate(tx, rx, ry, tz_start, force_cpu=True)
     
     # 🔍 検査ログ: Phase2のbase評価結果を記録
-    print(f"[STRICT phase2_base] score={base_score:.3f} area={base_info['total_area']:.4f} contacts={base_info['num_contacts']} dead={base_info['spring_zero']}")
+    print(f"[STRICT phase2_base] score={base_score:.3f} area={base_info['total_area']:.4f} contacts={base_info['num_contacts']} dead={base_info['dead_springs']}")
     ra_base = base_info["region_areas"]
     print(f"  area_by_region: M_L={ra_base['M_L']:.4f} M_R={ra_base['M_R']:.4f} PM_L={ra_base['PM_L']:.4f} PM_R={ra_base['PM_R']:.4f} ANT={ra_base['ANT']:.4f}")
     
     print(f"\n  base tz={tz_start:.3f} score={base_score:.3f} area={base_info['total_area']:.4f} "
-          f"contacts={base_info['num_contacts']} dead={base_info['spring_zero']}")
+          f"contacts={base_info['num_contacts']} dead={base_info['dead_springs']}")
 
     # ★閉口方向は診断から自動判定された closing_sign を使用
     step = closing_sign * abs(step)
@@ -2636,24 +2481,48 @@ def gyu_refine_tz(
     print(f"\n  候補スキャン（2段階評価）:")
     candidates = []  # 厳密評価待ちリスト
     
+
+    # --- Phase1 strict pose/resultを利用するための参照を取得 ---
+    phase1_strict_pose = None
+    phase1_strict_info = None
+    phase1_strict_score = None
+    if phase1_strict_result is not None:
+        try:
+            phase1_strict_pose = phase1_strict_result['pose']
+            phase1_strict_info = phase1_strict_result['info']
+            phase1_strict_score = phase1_strict_result['score']
+        except Exception:
+            pass
+
     while (tz <= tz_limit + 1e-9) if step > 0 else (tz >= tz_limit - 1e-9):
-        # ✅ Step1: 軽い評価で絞り込み（0.040mm探索閾値、速い）
-        scorer.search_mode = True
-        score_loose, info_loose = scorer.evaluate(tx, rx, ry, tz)
-        scorer.search_mode = False
-        
-        # 明らかにダメな候補は除外（緩い基準：5点以上で候補に）
-        if info_loose["num_contacts"] < 5:  # 8→5に緩和
-            print(f"    tz={tz:.3f} SKIP (loose contacts={info_loose['num_contacts']} < 5)")
-            tz += step
-            continue
-        
-        # ✅ Step2: 厳密評価（0.035mm CPU, Phase3と完全同一）
-        score, info = scorer.evaluate(tx, rx, ry, tz, force_cpu=True)
-        
+        # Phase1 strict poseと完全一致ならキャッシュを使う
+        use_cache = False
+        if phase1_strict_pose is not None:
+            if (abs(tx - phase1_strict_pose['tx']) < 1e-9 and
+                abs(rx - phase1_strict_pose['rx']) < 1e-9 and
+                abs(ry - phase1_strict_pose['ry']) < 1e-9 and
+                abs(tz - phase1_strict_pose['tz']) < 1e-9):
+                use_cache = True
+
+        if use_cache:
+            score = phase1_strict_score
+            info = phase1_strict_info
+        else:
+            # ✅ Step1: 軽い評価で絞り込み（0.040mm探索閾値、速い）
+            scorer.search_mode = True
+            score_loose, info_loose = scorer.evaluate(tx, rx, ry, tz)
+            scorer.search_mode = False
+            # 明らかにダメな候補は除外（緩い基準：5点以上で候補に）
+            if info_loose["num_contacts"] < 5:  # 8→5に緩和
+                print(f"    tz={tz:.3f} SKIP (loose contacts={info_loose['num_contacts']} < 5)")
+                tz += step
+                continue
+            # ✅ Step2: 厳密評価（0.035mm CPU, Phase3と完全同一）
+            score, info = scorer.evaluate(tx, rx, ry, tz, force_cpu=True)
+
         # 厳密基準で除外
-        if info["spring_zero"] > 0:
-            print(f"    tz={tz:.3f} SKIP (dead_springs={info['spring_zero']})")
+        if info["dead_springs"] > 0:
+            print(f"    tz={tz:.3f} SKIP (dead_springs={info['dead_springs']})")
             tz += step
             continue
 
@@ -2665,10 +2534,9 @@ def gyu_refine_tz(
         # objective 計算（★Phase3と完全同一の評価関数）
         if score >= base_score - max_score_drop:
             obj, comp = objective_from_info(score, info, scorer, w_lr, w_pml, pml_margin, w_mr)
-            
             if obj > best_obj:
                 print(f"  ★ tz={tz:.3f} obj={obj:.3f} score={score:.3f} area={info['total_area']:.4f} "
-                      f"contacts={info['num_contacts']} dead={info['spring_zero']} | "
+                      f"contacts={info['num_contacts']} dead={info['dead_springs']} | "
                       f"pen_lr={comp['pen_lr']:.4f} excess={comp['excess']:.4f} mr={comp['mr']:.4f} (IMPROVED)")
                 best_obj, best_tz, best_score, best_info = obj, tz, score, info
             else:
@@ -2678,7 +2546,7 @@ def gyu_refine_tz(
         tz += step
 
     print(f"\n[Phase2] 最終結果（CPU厳密 0.035mm）: tz={best_tz:.3f} obj={best_obj:.3f} score={best_score:.3f} "
-          f"area={best_info['total_area']:.4f} contacts={best_info['num_contacts']} dead={best_info['spring_zero']}")
+          f"area={best_info['total_area']:.4f} contacts={best_info['num_contacts']} dead={best_info['dead_springs']}")
     return best_tz, best_score, best_info
 
 
