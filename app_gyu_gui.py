@@ -64,6 +64,7 @@ class OcclusionOptimizerGUI:
         # パラメータ変数
         self.move_mode = tk.StringVar(value="lower")
         self.sample_size = tk.IntVar(value=1200)
+        self.upper_sample_count = tk.IntVar(value=100000)
         # 全顎/片顎モード
         self.arch_mode = tk.StringVar(value="full")  # "full" or "partial"
         self.arch_side = tk.StringVar(value="right")  # "right" or "left"
@@ -126,6 +127,13 @@ class OcclusionOptimizerGUI:
 
         ttk.Label(main_frame, text="最適化パラメータ", font=("", 12, "bold")).grid(
             row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 10))
+        row += 1
+
+        # 上顎サンプリング数入力欄
+        ttk.Label(main_frame, text="上顎サンプリング数:").grid(row=row, column=0, sticky=tk.W)
+        upper_sample_spin = ttk.Spinbox(main_frame, from_=1000, to=1000000, increment=1000, textvariable=self.upper_sample_count, width=12)
+        upper_sample_spin.grid(row=row, column=1, sticky=tk.W, padx=5)
+        upper_sample_spin.set(self.upper_sample_count.get())
         row += 1
 
         # 全顎/片顎モード選択
@@ -260,7 +268,8 @@ class OcclusionOptimizerGUI:
                 "app_gyu.py",
                 "--upper", self.upper_stl_path.get(),
                 "--lower", self.lower_stl_path.get(),
-                "--move", self.move_mode.get()
+                "--move", self.move_mode.get(),
+                "--upper-sample-count", str(self.upper_sample_count.get())
             ]
             # 片顎モードの場合は追加引数
             if self.arch_mode.get() == "partial":
